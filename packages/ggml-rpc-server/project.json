@@ -13,7 +13,11 @@
           "hasTsChecks": true,
           "tsChecksMode": "dts+lint"
         }
-      }
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/vcpkg-overlays/ports/qvac-fabric/**"
+      ]
     }
   }
 }

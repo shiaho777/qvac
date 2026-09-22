@@ -28,6 +28,7 @@ on:
     paths:
       - "packages/**"
       - "cmake/qvac-addon/**"
+      - "vcpkg-overlays/ports/qvac-fabric/**"
       - ".github/workflows/on-pr-ts-nx.yml"
       - ".github/workflows/reusable-ts-checks.yml"
 
