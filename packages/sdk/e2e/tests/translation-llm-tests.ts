@@ -1,4 +1,40 @@
-import type { TestDefinition } from '@qvac/test-suite'
+import type { Step, TestDefinition } from '@qvac/test-suite'
+
+/**
+ * One LLM-backed translation, folded to its text.
+ *
+ * `from` and `context` are optional references: left out when the test does
+ * not set them, which is how the autodetect case says "no source language"
+ * without needing a body of its own. `stream: false` because `text` is the
+ * handle that carries the result in non-streaming mode on both clients -- the
+ * streaming case reads the token stream instead and stays on the executor
+ * until the vocabulary can say "and it arrived in more than one piece".
+ */
+const translateSteps = (extra: Step[] = []): Step[] => [
+  { useModel: { deps: ['llm'], as: 'model' } },
+  {
+    call: {
+      method: 'translate',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        text: '$params.text',
+        to: '$params.to',
+        from: '$params.from?',
+        context: '$params.context?',
+        modelType: 'llamacpp-completion',
+        stream: false
+      },
+      as: 'run'
+    }
+  },
+  { project: { from: '$run', path: 'text', as: 'text' } },
+  { assert: { on: '$text', use: 'expectation' } },
+  ...extra
+]
+
+/** The executor additionally required real output from these two. */
+const producesText: Step[] = [{ assert: { on: '$text', named: 'nonEmptyText' } }]
 
 const createLlmTest = (
   testId: string,
@@ -17,6 +53,7 @@ const createLlmTest = (
   },
   expectation: { validation: 'type', expectedType: 'string' },
   ...(suites && { suites }),
+  steps: translateSteps(opts.context ? producesText : []),
   metadata: {
     category: 'translation-llm',
     dependency: 'llm',
@@ -43,11 +80,15 @@ export const llmEsEn = createLlmTest(
   { from: 'es' }
 )
 
-export const llmAutodetect = createLlmTest(
-  'translation-llm-autodetect',
-  "Bonjour, comment allez-vous aujourd'hui?",
-  'en'
-)
+export const llmAutodetect: TestDefinition = {
+  testId: 'translation-llm-autodetect',
+  params: { text: "Bonjour, comment allez-vous aujourd'hui?", to: 'en', resource: 'llm' },
+  expectation: { validation: 'type', expectedType: 'string' },
+  // No `from`: the optional reference resolves to nothing and the argument is
+  // left off the call, so the worker detects the source language.
+  steps: translateSteps(producesText),
+  metadata: { category: 'translation-llm', dependency: 'llm', estimatedDurationMs: 90000 }
+}
 
 export const llmStreaming: TestDefinition = {
   testId: 'translation-llm-streaming',

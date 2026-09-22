@@ -11,7 +11,8 @@ import {
   modelRegistryList,
   modelRegistrySearch,
   ragIngest,
-  transcribe
+  transcribe,
+  translate
 } from '@qvac/sdk'
 import { StepIncompleteError, type CollectMode, type StepBindings } from '@qvac/test-suite'
 import type { ResourceManager } from './resource-manager.js'
@@ -76,6 +77,20 @@ const STREAMS: Record<string, (params: never, collect: CollectMode) => Promise<u
       return { events }
     }
     throw new StepIncompleteError(`collect: "${collect}" is not defined for completion`)
+  },
+
+  translate: async (params, collect) => {
+    if (collect !== 'text') {
+      throw new StepIncompleteError(`collect: "${collect}" is not defined for translate`)
+    }
+    const p = params as unknown as { stream?: boolean }
+    const run = translate(params)
+    // `text` resolves to the empty string in streaming mode on both clients, so
+    // the fold has to follow the mode rather than always await the same handle.
+    if (!p.stream) return { text: await run.text }
+    let text = ''
+    for await (const token of run.tokenStream) text += token
+    return { text }
   }
 }
 
@@ -196,6 +211,23 @@ const ASSERTIONS: Record<
       passed: true,
       output: `hasCause=${Boolean(err.hasCause)}, code=${err.code || '(none)'}`
     }
+  },
+
+  /**
+   * The value is a string with something in it.
+   *
+   * `expectedType: 'string'` only asks about the type, and `minLength` in the
+   * expectation applies to arrays, so "it produced text" had no way to be said
+   * until now. Every generative category needs it.
+   */
+  nonEmptyText(value) {
+    if (typeof value !== 'string') {
+      return { passed: false, output: `expected a string, got ${typeof value}` }
+    }
+    if (value.trim().length === 0) {
+      return { passed: false, output: 'expected text, got an empty string' }
+    }
+    return { passed: true, output: `${value.length} character(s)` }
   },
 
   loadedModelInfoShape(value, args) {

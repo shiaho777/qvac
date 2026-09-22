@@ -92,6 +92,20 @@ def error_is_structured(value: Any, args: dict[str, Any]) -> StepResult:
     )
 
 
+def non_empty_text(value: Any, args: dict[str, Any]) -> StepResult:
+    """The value is a string with something in it.
+
+    `expectedType: "string"` only asks about the type, and `minLength` in the
+    expectation applies to arrays, so "it produced text" had no way to be said
+    until now. Every generative category needs it.
+    """
+    if not isinstance(value, str):
+        return StepResult.fail(f"expected a string, got {type(value).__name__}")
+    if not value.strip():
+        return StepResult.fail("expected text, got an empty string")
+    return StepResult.ok(f"{len(value)} character(s)")
+
+
 def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """`getLoadedModelInfo` returned a record describing the model we loaded.
 
@@ -132,5 +146,6 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "fieldsPresent": fields_present,
     "fieldsMatch": fields_match,
     "errorIsStructured": error_is_structured,
+    "nonEmptyText": non_empty_text,
     "loadedModelInfoShape": loaded_model_info_shape,
 }

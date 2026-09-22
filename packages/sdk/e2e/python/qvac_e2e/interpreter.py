@@ -28,6 +28,7 @@ from tetherto.qvac_sdk import (
     model_registry_get_model,
     model_registry_list,
     model_registry_search,
+    translate,
 )
 
 from .assertions import ASSERTIONS
@@ -118,10 +119,37 @@ async def _completion_stream(
     )
 
 
+async def _translate_stream(transport: Any, params: dict[str, Any], collect: str) -> Any:
+    if collect != "text":
+        raise StepError(
+            f'collect: "{collect}" is not defined for translate', incomplete=True
+        )
+    stream = params.get("stream", True)
+    run = translate(
+        transport,
+        model_id=params["modelId"],
+        text=params["text"],
+        model_type=params["modelType"],
+        to=params.get("to"),
+        from_=params.get("from"),
+        stream=stream,
+        context=params.get("context"),
+    )
+    if not stream:
+        return {"text": await run.text}
+    # `text` resolves to the empty string in streaming mode on both clients, so
+    # the fold has to follow the mode rather than always await the same handle.
+    text = ""
+    async for token in run.token_stream:
+        text += token
+    return {"text": text}
+
+
 # Methods whose result is a stream handle rather than a value. A step reaches
 # these through `collect`, which names the fold it wants.
 STREAMS: dict[str, Callable[[Any, dict[str, Any], str], Any]] = {
     "completion": _completion_stream,
+    "translate": _translate_stream,
 }
 
 # Methods whose Python surface is NOT yet the ergonomic equivalent of the JS
