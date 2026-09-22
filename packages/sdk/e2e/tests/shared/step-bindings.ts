@@ -1,18 +1,48 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import {
+  audioEdit,
+  audioGen,
+  audioUnderstand,
+  batchCompletion,
+  bciTranscribe,
+  cancel,
   classify,
   completion,
+  createVectorIndex,
   deleteCache,
+  diffusion,
+  downloadAsset,
   embed,
+  finetune,
   getLoadedModelInfo,
+  getModelInfo,
+  getSystemResources,
+  heartbeat,
+  invokePlugin,
+  invokePluginStream,
   loadModel,
+  loadVectorIndex,
   modelRegistryGetModel,
   modelRegistryList,
   modelRegistrySearch,
+  ocr,
+  ragDeleteWorkspace,
   ragIngest,
+  resume,
+  state,
+  suspend,
+  textToSpeech,
   transcribe,
-  translate
+  transcribeStream,
+  translate,
+  unloadModel,
+  upscale,
+  vla,
+  vlaHparams,
+  vlaSetEmbodiment,
+  worldCreateScene,
+  worldStep
 } from '@qvac/sdk'
 import { StepIncompleteError, type CollectMode, type StepBindings } from '@qvac/test-suite'
 import type { ResourceManager } from './resource-manager.js'
@@ -39,14 +69,26 @@ import type { ResourceManager } from './resource-manager.js'
  * one entry at a time as categories migrate.
  */
 const CALLS: Record<string, (params: never) => Promise<unknown>> = {
+  // --- inference, request/reply -------------------------------------------
   embed: (params) => embed(params),
-  getLoadedModelInfo: (params) => getLoadedModelInfo(params),
   classify: async (params) => ({ results: await classify(params) }),
+  transcribe: async (params) => ({ text: await transcribe(params) }),
+  bciTranscribe: async (params) => ({ text: await bciTranscribe(params) }),
+  vla: (params) => vla(params),
+  vlaHparams: (params) => vlaHparams(params),
+  vlaSetEmbodiment: (params) => vlaSetEmbodiment(params),
 
-  // The registry trio takes its arguments differently in each language --
-  // positional here, keyword in Python. The contract name and the params
-  // object in the step are what both sides agree on; adapting to the local
-  // signature is precisely what a binding is for.
+  // --- models --------------------------------------------------------------
+  loadModel: async (params) => ({ modelId: await loadModel(params) }),
+  unloadModel: (params) => unloadModel(params),
+  getModelInfo: (params) => getModelInfo(params),
+  getLoadedModelInfo: (params) => getLoadedModelInfo(params),
+
+  // --- registry ------------------------------------------------------------
+  // The trio takes its arguments differently in each language -- positional
+  // here, keyword in Python. The contract name and the params object in the
+  // step are what both sides agree on; adapting to the local signature is
+  // precisely what a binding is for.
   modelRegistryList: () => modelRegistryList(),
   modelRegistrySearch: (params) => modelRegistrySearch(params),
   modelRegistryGetModel: (params: never) => {
@@ -54,44 +96,223 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
     return modelRegistryGetModel(p.registryPath, p.registrySource)
   },
 
-  loadModel: (params) => loadModel(params),
+  // --- runtime and host ----------------------------------------------------
+  cancel: (params) => cancel(params),
   deleteCache: (params) => deleteCache(params),
+  downloadAsset: async (params) => ({ path: await downloadAsset(params) }),
+  getSystemResources: (params) => getSystemResources(params),
+  heartbeat: () => heartbeat(),
+  suspend: async () => {
+    await suspend()
+    return { suspended: true }
+  },
+  resume: async () => {
+    await resume()
+    return { resumed: true }
+  },
+  state: async () => ({ state: await state() }),
+
+  // --- rag and vector index ------------------------------------------------
   ragIngest: (params) => ragIngest(params),
-  transcribe: (params) => transcribe(params)
+  ragDeleteWorkspace: async (params) => {
+    await ragDeleteWorkspace(params)
+    return { deleted: true }
+  },
+  createVectorIndex: (params) => createVectorIndex(params),
+  loadVectorIndex: (params) => loadVectorIndex(params),
+
+  // --- plugins -------------------------------------------------------------
+  invokePlugin: async (params) => ({ result: await invokePlugin(params) }),
+
+  // --- world ---------------------------------------------------------------
+  worldCreateScene: async (params: never) => {
+    const scene = worldCreateScene(params)
+    return { requestId: scene.requestId, stats: await scene.stats }
+  }
+}
+
+/** Every value of an async iterator, in order. */
+async function drain<T>(source: AsyncIterable<T>): Promise<T[]> {
+  const out: T[] = []
+  for await (const value of source) out.push(value)
+  return out
+}
+
+/** Concatenate the pieces of a text stream. */
+async function joinStream(source: AsyncIterable<string>): Promise<string> {
+  let text = ''
+  for await (const piece of source) text += piece
+  return text
 }
 
 /**
- * Methods whose result is a stream handle rather than a value.
+ * How a streaming call is folded into one value, per method.
  *
- * A step reaches these through `collect`, which names the fold it wants. The
- * fold is the interesting part of the binding: two clients are only running
- * the same test if "the text of this completion" means the same thing on both.
+ * The fold is the interesting half of a streaming binding: two clients are
+ * only running the same test if "the text of this completion" or "the frames
+ * of this block" means the same thing on both. Each entry returns an object so
+ * a later `project` step has a field to pull, and the field is named after the
+ * fold -- `text`, `blocks`, `events`, `pcm`, `last`, `all` -- so a definition
+ * reads the same regardless of which SDK produced the value.
+ *
+ * A method that has no entry for the mode a step asked for reports
+ * `incomplete`. That is a gap in these bindings, not a failing test.
  */
-const STREAMS: Record<string, (params: never, collect: CollectMode) => Promise<unknown>> = {
+type Fold = (params: never, collect: CollectMode) => Promise<unknown>
+
+const STREAMS: Record<string, Fold> = {
   completion: async (params, collect) => {
     const run = completion(params)
     if (collect === 'text') return { text: await run.text }
-    if (collect === 'events') {
-      const events: unknown[] = []
-      for await (const event of run.events) events.push(event)
-      return { events }
-    }
-    throw new StepIncompleteError(`collect: "${collect}" is not defined for completion`)
+    if (collect === 'events') return { events: await drain(run.events) }
+    if (collect === 'all') return { all: await drain(run.tokenStream) }
+    throw unsupported('completion', collect)
   },
 
   translate: async (params, collect) => {
-    if (collect !== 'text') {
-      throw new StepIncompleteError(`collect: "${collect}" is not defined for translate`)
-    }
     const p = params as unknown as { stream?: boolean }
     const run = translate(params)
+    if (collect === 'all') return { all: await drain(run.tokenStream) }
+    if (collect !== 'text') throw unsupported('translate', collect)
     // `text` resolves to the empty string in streaming mode on both clients, so
     // the fold has to follow the mode rather than always await the same handle.
     if (!p.stream) return { text: await run.text }
-    let text = ''
-    for await (const token of run.tokenStream) text += token
-    return { text }
+    return { text: await joinStream(run.tokenStream) }
+  },
+
+  transcribeStream: async (params, collect) => {
+    const pieces = await drain(transcribeStream(params) as AsyncIterable<unknown>)
+    if (collect === 'blocks') return { blocks: pieces }
+    if (collect === 'all') return { all: pieces }
+    if (collect === 'last') return { last: pieces.at(-1) }
+    if (collect === 'text') return { text: pieces.map((p) => String(p)).join('') }
+    throw unsupported('transcribeStream', collect)
+  },
+
+  ocr: async (params, collect) => {
+    const run = ocr(params)
+    if (collect === 'blocks') return { blocks: await run.blocks }
+    if (collect === 'all') return { all: await drain(run.blockStream) }
+    if (collect === 'text') {
+      const blocks = await run.blocks
+      return { text: blocks.map((block) => block.text).join('\n') }
+    }
+    if (collect === 'events') return { events: await drain(run.blockStream) }
+    throw unsupported('ocr', collect)
+  },
+
+  textToSpeech: async (params, collect) => {
+    const run = textToSpeech(params)
+    if (collect === 'pcm') {
+      const pcm = await run.buffer
+      return { pcm, sampleRate: await run.sampleRate, done: await run.done }
+    }
+    if (collect === 'all') return { all: await drain(run.bufferStream) }
+    if (collect === 'events') {
+      return { events: run.chunkUpdates ? await drain(run.chunkUpdates) : [] }
+    }
+    throw unsupported('textToSpeech', collect)
+  },
+
+  diffusion: async (params, collect) => {
+    const run = diffusion(params)
+    if (collect === 'events') {
+      // Draining progress before awaiting the outputs is not a style choice:
+      // the generator is the live side of the same stream, and awaiting first
+      // would leave nothing to iterate.
+      const events = await drain(run.progressStream)
+      await run.outputs
+      return { events }
+    }
+    if (collect === 'all') return { all: await run.outputs }
+    if (collect === 'last') {
+      const outputs = await run.outputs
+      return { last: outputs.at(-1) }
+    }
+    throw unsupported('diffusion', collect)
+  },
+
+  upscale: async (params, collect) => {
+    const run = upscale(params)
+    if (collect === 'all') return { all: await run.outputs }
+    if (collect === 'last') {
+      const outputs = await run.outputs
+      return { last: outputs.at(-1) }
+    }
+    throw unsupported('upscale', collect)
+  },
+
+  audioGen: async (params, collect) => audioRun(audioGen(params), collect, 'audioGen'),
+  audioEdit: async (params, collect) => audioRun(audioEdit(params), collect, 'audioEdit'),
+
+  audioUnderstand: async (params, collect) => {
+    const run = audioUnderstand(params)
+    if (collect === 'text') return { text: await run.description }
+    if (collect === 'events') return { events: await drain(run.progressStream) }
+    throw unsupported('audioUnderstand', collect)
+  },
+
+  batchCompletion: async (params, collect) => {
+    const run = batchCompletion(params)
+    if (collect === 'all') return { all: await run.results }
+    if (collect === 'events') return { events: await drain(run.events) }
+    throw unsupported('batchCompletion', collect)
+  },
+
+  worldStep: async (params, collect) => {
+    const run = worldStep(params)
+    if (collect === 'all') return { all: await drain(run.frameStream) }
+    if (collect === 'last') {
+      const frames = await drain(run.frameStream)
+      return { last: frames.at(-1), frameCount: frames.length }
+    }
+    if (collect === 'events') {
+      const frames = await drain(run.frameStream)
+      return { events: await drain(run.progressStream), frameCount: frames.length }
+    }
+    throw unsupported('worldStep', collect)
+  },
+
+  finetune: async (params, collect) => {
+    const handle = finetune(params)
+    if (collect === 'events') {
+      const events = await drain(handle.progressStream)
+      return { events, last: await handle.result }
+    }
+    if (collect === 'last') return { last: await handle.result }
+    throw unsupported('finetune', collect)
+  },
+
+  invokePluginStream: async (params, collect) => {
+    const chunks = await drain(invokePluginStream(params))
+    if (collect === 'all') return { all: chunks }
+    if (collect === 'last') return { last: chunks.at(-1) }
+    if (collect === 'text') return { text: chunks.map((c) => String(c)).join('') }
+    throw unsupported('invokePluginStream', collect)
   }
+}
+
+/** `audioGen` and `audioEdit` return the same handle, so they fold the same. */
+async function audioRun(
+  run: {
+    audio: Promise<unknown>
+    progressStream: AsyncIterable<unknown>
+    stats: Promise<unknown>
+  },
+  collect: CollectMode,
+  method: string
+): Promise<unknown> {
+  if (collect === 'pcm') return { pcm: await run.audio, stats: await run.stats }
+  if (collect === 'events') {
+    const events = await drain(run.progressStream)
+    await run.audio
+    return { events }
+  }
+  throw unsupported(method, collect)
+}
+
+function unsupported(method: string, collect: CollectMode): StepIncompleteError {
+  return new StepIncompleteError(`collect: "${collect}" is not defined for ${method}`)
 }
 
 /**
@@ -288,6 +509,7 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
         }
         return stream(params as never, collect)
       }
+
       const call = CALLS[method]
       if (!call) {
         throw new StepIncompleteError(`SDK method "${method}" is not wired into these bindings yet`)

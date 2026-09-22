@@ -18,17 +18,49 @@ from collections.abc import Callable
 from typing import Any
 
 from tetherto.qvac_sdk import (
+    BciTranscribeRequest,
+    ClassifyRequest,
+    DownloadAssetRequest,
     EmbedRequest,
+    FinetuneRequest,
     GetLoadedModelInfoRequest,
+    GetModelInfoRequest,
+    GetSystemResourcesRequest,
+    HeartbeatRequest,
+    RagRequest,
+    ResumeRequest,
+    StateRequest,
+    SuspendRequest,
+    TranscribeRequest,
+    VectorIndexRequest,
+    bci_transcribe,
+    cancel,
+    classify,
     completion,
     delete_cache,
+    download_asset,
     embed,
+    finetune,
     get_loaded_model_info,
+    get_model_info,
+    get_system_resources,
+    heartbeat,
+    invoke_plugin,
     load_model,
     model_registry_get_model,
     model_registry_list,
     model_registry_search,
+    rag,
+    resume,
+    state,
+    suspend,
+    transcribe,
     translate,
+    unload_model,
+    vector_index,
+    vla,
+    vla_hparams,
+    vla_set_embodiment,
 )
 
 from .assertions import ASSERTIONS
@@ -58,10 +90,28 @@ def _request(model: Any, method: str, call: Callable[..., Any]) -> Callable[...,
 
 
 CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
+    # --- inference, request/reply -------------------------------------------
     "embed": _request(EmbedRequest, "embed", embed),
+    "classify": _request(ClassifyRequest, "classify", classify),
+    "transcribe": _request(TranscribeRequest, "transcribe", transcribe),
+    "bciTranscribe": _request(BciTranscribeRequest, "bciTranscribe", bci_transcribe),
+    "vla": lambda transport, params: vla(transport, **_snake(params)),
+    "vlaHparams": lambda transport, params: vla_hparams(
+        transport, model_id=params["modelId"]
+    ),
+    "vlaSetEmbodiment": lambda transport, params: vla_set_embodiment(
+        transport, model_id=params["modelId"], embodiment=params["embodiment"]
+    ),
+    # --- models --------------------------------------------------------------
+    "loadModel": lambda transport, params: _load_model(transport, params),
+    "unloadModel": lambda transport, params: unload_model(
+        transport, model_id=params["modelId"]
+    ),
+    "getModelInfo": _request(GetModelInfoRequest, "getModelInfo", get_model_info),
     "getLoadedModelInfo": _request(
         GetLoadedModelInfoRequest, "getLoadedModelInfo", get_loaded_model_info
     ),
+    # --- registry ------------------------------------------------------------
     "modelRegistryList": lambda transport, params: model_registry_list(transport),
     "modelRegistrySearch": lambda transport, params: model_registry_search(
         transport,
@@ -74,13 +124,16 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "modelRegistryGetModel": lambda transport, params: model_registry_get_model(
         transport, params["registryPath"], params["registrySource"]
     ),
-    "loadModel": lambda transport, params: load_model(
+    # --- runtime and host ----------------------------------------------------
+    # An ergonomic wrapper, so keyword arguments -- `_request` passes a
+    # validated request model positionally, which is the raw stub's convention
+    # and a TypeError here.
+    "cancel": lambda transport, params: cancel(
         transport,
-        model_src=params.get("modelSrc"),
-        model_type=params.get("modelType"),
-        model_config=params.get("modelConfig"),
-        model_name=params.get("modelName"),
+        request_id=params.get("requestId"),
         model_id=params.get("modelId"),
+        kind=params.get("kind"),
+        clear_cache=params.get("clearCache"),
     ),
     "deleteCache": lambda transport, params: delete_cache(
         transport,
@@ -89,7 +142,53 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
         kv_cache_key=params.get("kvCacheKey"),
         model_id=params.get("modelId"),
     ),
+    "downloadAsset": _request(DownloadAssetRequest, "downloadAsset", download_asset),
+    "getSystemResources": _request(
+        GetSystemResourcesRequest, "getSystemResources", get_system_resources
+    ),
+    "heartbeat": _request(HeartbeatRequest, "heartbeat", heartbeat),
+    "suspend": _request(SuspendRequest, "suspend", suspend),
+    "resume": _request(ResumeRequest, "resume", resume),
+    "state": _request(StateRequest, "state", state),
+    # --- rag, vector index, finetune -----------------------------------------
+    "ragIngest": _request(RagRequest, "rag", rag),
+    "ragDeleteWorkspace": _request(RagRequest, "rag", rag),
+    "createVectorIndex": _request(VectorIndexRequest, "vectorIndex", vector_index),
+    "loadVectorIndex": _request(VectorIndexRequest, "vectorIndex", vector_index),
+    "finetune": _request(FinetuneRequest, "finetune", finetune),
+    # --- plugins -------------------------------------------------------------
+    "invokePlugin": lambda transport, params: invoke_plugin(
+        transport,
+        model_id=params["modelId"],
+        handler=params["handler"],
+        params=params.get("params"),
+    ),
 }
+
+
+def _snake(params: dict[str, Any]) -> dict[str, Any]:
+    """camelCase step params -> the snake_case keyword arguments Python uses."""
+    out: dict[str, Any] = {}
+    for key, value in params.items():
+        out[re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower()] = value
+    return out
+
+
+def _load_model(transport: Any, params: dict[str, Any]) -> Any:
+    async def run() -> dict[str, Any]:
+        model_id = await load_model(
+            transport,
+            model_src=params.get("modelSrc"),
+            model_type=params.get("modelType"),
+            model_config=params.get("modelConfig"),
+            model_name=params.get("modelName"),
+            model_id=params.get("modelId"),
+        )
+        # JS binds `{ modelId }` so a later step can project it; matching that
+        # here keeps one definition working on both clients.
+        return {"modelId": model_id}
+
+    return run()
 
 
 async def _completion_stream(
@@ -110,6 +209,7 @@ async def _completion_stream(
         generation_params=params.get("generationParams"),
         tools=params.get("tools"),
         response_format=params.get("responseFormat"),
+        tool_dialect=params.get("toolDialect"),
     )
     if collect == "text":
         return {"text": await run.text()}
@@ -150,9 +250,77 @@ async def _translate_stream(
 
 # Methods whose result is a stream handle rather than a value. A step reaches
 # these through `collect`, which names the fold it wants.
+#
+# Only the methods for which the Python SDK ships a *run handle* are here. The
+# generated `<name>_stream` stubs exist for the rest, but they yield raw wire
+# chunks: folding those in this client would mean writing the SDK's ergonomics
+# inside the test client, and the test would then pass while the SDK still had
+# no wrapper. That is the one thing this whole exercise is meant to prevent, so
+# those methods report `incomplete` with the reason instead -- see
+# NO_RUN_HANDLE.
 STREAMS: dict[str, Callable[[Any, dict[str, Any], str], Any]] = {
     "completion": _completion_stream,
     "translate": _translate_stream,
+}
+
+# Streaming methods where the Python SDK has only the generated stub.
+#
+# This table is the client's own roadmap, and shrinking it is the number the
+# release claim is about. Each entry says what JS returns, because that is the
+# shape a definition written against the reference client assumes.
+NO_RUN_HANDLE: dict[str, str] = {
+    "ocr": (
+        "Python has only the generated ocr_stream stub, which yields raw wire "
+        "chunks; JS returns a run with blockStream/blocks/stats. Needs an "
+        "ergonomic wrapper before a definition written against the JS shape "
+        "can run here."
+    ),
+    "transcribeStream": (
+        "Python has transcribe_stream and transcribe_stream_session, neither "
+        "shaped like the JS generator of segments. Needs an ergonomic wrapper."
+    ),
+    "textToSpeech": (
+        "Python has only the generated text_to_speech_stream stub; JS returns "
+        "a run with bufferStream/buffer/done/sampleRate. Needs an ergonomic "
+        "wrapper."
+    ),
+    "diffusion": (
+        "Python has only the generated diffusion_stream stub; JS returns a run "
+        "with progressStream/outputs/stats. Needs an ergonomic wrapper."
+    ),
+    "upscale": (
+        "Python has only the generated upscale_stream stub; JS returns a run "
+        "with outputs/stats. Needs an ergonomic wrapper."
+    ),
+    "audioGen": (
+        "Python has only the generated audio_gen_stream stub; JS returns a run "
+        "with progressStream/audio/stats. Needs an ergonomic wrapper."
+    ),
+    "audioEdit": (
+        "Python has only the generated audio_edit_stream stub; JS returns a run "
+        "with progressStream/audio/stats. Needs an ergonomic wrapper."
+    ),
+    "audioUnderstand": (
+        "Python has only the generated audio_understand stub; JS returns a run "
+        "with progressStream/description/stats. Needs an ergonomic wrapper."
+    ),
+    "batchCompletion": (
+        "Python has only the generated batch_completion_stream stub; JS returns "
+        "a run with events/results. Needs an ergonomic wrapper."
+    ),
+    "worldStep": (
+        "Python has only the generated world_step_stream stub; JS returns a run "
+        "with frameStream/progressStream. Needs an ergonomic wrapper."
+    ),
+    "finetune": (
+        "Python's finetune is the generated reply stub; JS returns a handle "
+        "with progressStream/result. Needs an ergonomic wrapper for the "
+        "progress-bearing form."
+    ),
+    "invokePluginStream": (
+        "Python's invoke_plugin_stream yields decoded chunks but is not wired "
+        "into these bindings yet."
+    ),
 }
 
 # Methods whose Python surface is NOT yet the ergonomic equivalent of the JS
@@ -292,7 +460,7 @@ class Interpreter:
         method = body["method"]
         call = CALLS.get(method)
         collect = body.get("collect")
-        if call is None and (not collect or method not in STREAMS):
+        if call is None and not collect:
             raise StepError(
                 f'SDK method "{method}" is not wired into the Python interpreter yet',
                 incomplete=True,
@@ -332,7 +500,8 @@ class Interpreter:
             stream = STREAMS.get(method)
             if stream is None:
                 raise StepError(
-                    f'SDK method "{method}" has no stream fold in the Python '
+                    NO_RUN_HANDLE.get(method)
+                    or f'SDK method "{method}" has no stream fold in the Python '
                     "interpreter yet",
                     incomplete=True,
                 )
@@ -396,7 +565,7 @@ class Interpreter:
         collect = body.get("collect")
         # A streaming method lives in STREAMS, not CALLS, so a step that asks
         # for a fold must be allowed through even though CALLS has no entry.
-        if call is None and (not collect or method not in STREAMS):
+        if call is None and not collect:
             raise StepError(
                 f'SDK method "{method}" is not wired into the Python interpreter yet',
                 incomplete=True,
