@@ -1,47 +1,82 @@
 """Resource key -> model, and the load/evict lifecycle around a test.
 
-This mirrors `tests/shared/resource-manager.ts`. It is duplicated per client
-on purpose *for now*: the JS table lives inside the consumer entry files,
-which an interpreter in another language cannot read. Moving the table into
-the catalog as shared data is its own phase; until then keeping a small,
-explicit copy here is honest about the duplication and cheap to delete.
+The table itself is no longer written here. `tests/catalog/resources.json` is
+the shared copy every client reads, because a definition that says
+`useModel: { deps: ["whisper"] }` only means the same thing on two clients if
+both resolve `whisper` to the same model with the same config. What stays here
+is the part that cannot be data: turning a `$const` name into this SDK's model
+descriptor, and a `$asset` placeholder into a path on this platform.
 
-Only the keys a migrated category needs are defined. An unknown key is an
-`incomplete` result, not a crash: the test applies, this client cannot run it
-yet.
+An unknown key is an `incomplete` result, not a crash: the test applies, this
+client cannot run it yet.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 from tetherto.qvac_sdk import load_model, unload_model
 from tetherto.qvac_sdk import models as model_constants
 
+# The shared table, relative to this client. Overridable so a run can point at
+# a catalog somewhere else without editing code.
+_TABLE_PATH = Path(
+    os.environ.get("QVAC_RESOURCE_TABLE")
+    or Path(__file__).resolve().parents[2] / "tests" / "catalog" / "resources.json"
+)
 
-@dataclass(frozen=True)
-class ResourceDefinition:
-    """One entry of the shared resource table."""
+# Where `$asset` placeholders point on this platform.
+_ASSET_ROOT = Path(
+    os.environ.get("QVAC_ASSET_ROOT") or Path(__file__).resolve().parents[2] / "assets"
+)
 
-    constant: str
-    model_type: str
-    config: dict[str, Any] | None = None
+_PLATFORM = os.environ.get("QVAC_RESOURCE_PLATFORM", "desktop")
 
 
-# Mirrors resources.define(...) in tests/desktop/consumer.ts. Grow this as
-# categories migrate; it disappears when the table moves into the catalog.
-RESOURCES: dict[str, ResourceDefinition] = {
-    "embeddings": ResourceDefinition(
-        constant="GTE_LARGE_FP16",
-        model_type="llamacpp-embedding",
-    ),
-    "llm": ResourceDefinition(
-        constant="LLAMA_3_2_1B_INST_Q4_0",
-        model_type="llamacpp-completion",
-        config={"verbosity": 0, "ctx_size": 2048},
-    ),
-}
+def _load_table() -> dict[str, dict[str, Any]]:
+    if not _TABLE_PATH.exists():
+        return {}
+    table = json.loads(_TABLE_PATH.read_text())
+    # `on` narrows a key to the platforms that define it; absent means all.
+    return {
+        dep: entry
+        for dep, entry in table.items()
+        if _PLATFORM in entry.get("on", [_PLATFORM])
+    }
+
+
+RESOURCES: dict[str, dict[str, Any]] = _load_table()
+
+
+class MissingConstantError(LookupError):
+    pass
+
+
+def _resolve(value: Any) -> Any:
+    """Replace `$const` and `$asset` placeholders, recursively.
+
+    Recursive because the placeholders nest: a companion model sits inside
+    `config`, sometimes inside an object inside `config`.
+    """
+    if isinstance(value, list):
+        return [_resolve(item) for item in value]
+    if isinstance(value, dict):
+        name = value.get("$const")
+        if isinstance(name, str):
+            constant = getattr(model_constants, name, None)
+            if constant is None:
+                raise MissingConstantError(
+                    f'model constant "{name}" is missing from the Python registry'
+                )
+            return constant
+        asset = value.get("$asset")
+        if isinstance(asset, dict):
+            return str(_ASSET_ROOT / asset["kind"] / asset["file"])
+        return {key: _resolve(item) for key, item in value.items()}
+    return value
 
 
 class UnknownResourceError(LookupError):
@@ -65,13 +100,35 @@ class ResourceManager:
     def transport(self) -> Any:
         return self._transport
 
-    def _definition(self, dep: str) -> ResourceDefinition:
+    def _definition(self, dep: str) -> dict[str, Any]:
         definition = RESOURCES.get(dep)
         if definition is None:
             raise UnknownResourceError(
-                f'resource "{dep}" is not in the Python resource table yet'
+                f'resource "{dep}" is not defined for platform "{_PLATFORM}" in '
+                f"{_TABLE_PATH.name}"
             )
         return definition
+
+    def source_of(self, dep: str) -> dict[str, Any]:
+        """What `loadModel` would be called with for this key, without calling it.
+
+        A test that drives the load path itself needs the source as data, and
+        the source is the one thing a definition cannot write down: it is a
+        per-client constant. The shared table knows it.
+        """
+        definition = self._definition(dep)
+        try:
+            source = _resolve(definition.get("constant"))
+        except MissingConstantError as error:
+            raise UnknownResourceError(str(error)) from error
+        out: dict[str, Any] = {}
+        if source is not None:
+            out["modelSrc"] = source
+        if definition.get("modelSrc") is not None:
+            out["modelSrc"] = definition["modelSrc"]
+        if definition.get("type"):
+            out["modelType"] = definition["type"]
+        return out
 
     async def ensure_loaded(self, dep: str) -> str:
         existing = self._loaded.get(dep)
@@ -79,18 +136,18 @@ class ResourceManager:
             return existing
 
         definition = self._definition(dep)
-        constant = getattr(model_constants, definition.constant, None)
-        if constant is None:
-            raise UnknownResourceError(
-                f'model constant "{definition.constant}" is missing from the Python registry'
-            )
+        try:
+            constant = _resolve(definition.get("constant"))
+            config = _resolve(definition.get("config"))
+        except MissingConstantError as error:
+            raise UnknownResourceError(str(error)) from error
 
-        self._log(f"loading {dep} ({definition.constant})")
+        self._log(f"loading {dep}")
         model_id = await load_model(
             self._transport,
-            model_src=constant,
-            model_type=definition.model_type,
-            model_config=definition.config,
+            model_src=constant if constant is not None else definition.get("modelSrc"),
+            model_type=definition.get("type"),
+            model_config=config,
         )
         self._loaded[dep] = model_id
         return model_id

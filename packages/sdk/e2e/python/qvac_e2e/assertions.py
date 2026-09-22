@@ -13,6 +13,8 @@ than only against a constant.
 
 from __future__ import annotations
 
+import re
+
 from collections.abc import Callable
 from typing import Any
 
@@ -106,6 +108,32 @@ def non_empty_text(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(value)} character(s)")
 
 
+def error_matches(value: Any, args: dict[str, Any]) -> StepResult:
+    """The rejection is the one the test meant, by code and by wording.
+
+    `messageNotMatching` is the half that is easy to forget and the reason this
+    is not just a `contains`: several error tests exist to prove a bad argument
+    is rejected *by the SDK* rather than forwarded to the addon, and only the
+    wording of the failure tells those two apart.
+    """
+    err = value if isinstance(value, dict) else {}
+    message = err.get("message") or ""
+
+    expected_code = args.get("code")
+    if expected_code is not None and str(err.get("code")) != str(expected_code):
+        return StepResult.fail(f"expected code {expected_code}, got {err.get('code')}")
+
+    contains = args.get("messageContains")
+    if contains is not None and str(contains).lower() not in message.lower():
+        return StepResult.fail(f'message does not contain "{contains}": {message}')
+
+    forbidden = args.get("messageNotMatching")
+    if forbidden is not None and re.search(str(forbidden), message, re.IGNORECASE):
+        return StepResult.fail(f"message matched the forbidden pattern: {message}")
+
+    return StepResult.ok(f"code={err.get('code') or '(none)'}: {message[:120]}")
+
+
 def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """`getLoadedModelInfo` returned a record describing the model we loaded.
 
@@ -147,5 +175,6 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "fieldsMatch": fields_match,
     "errorIsStructured": error_is_structured,
     "nonEmptyText": non_empty_text,
+    "errorMatches": error_matches,
     "loadedModelInfoShape": loaded_model_info_shape,
 }

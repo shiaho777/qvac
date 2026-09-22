@@ -451,6 +451,39 @@ const ASSERTIONS: Record<
     return { passed: true, output: `${value.length} character(s)` }
   },
 
+  /**
+   * The rejection is the one the test meant, by code and by wording.
+   *
+   * `messageNotMatching` is the half that is easy to forget and the reason
+   * this is not just a `contains`: several error tests exist to prove a bad
+   * argument is rejected *by the SDK* rather than forwarded to the addon, and
+   * only the wording of the failure tells those two apart.
+   */
+  errorMatches(value, args) {
+    const err = (value ?? {}) as { code?: string; message?: string }
+    const message = err.message ?? ''
+
+    if (args.code !== undefined && String(err.code) !== String(args.code)) {
+      return { passed: false, output: `expected code ${String(args.code)}, got ${err.code}` }
+    }
+    if (
+      args.messageContains !== undefined &&
+      !message.toLowerCase().includes(String(args.messageContains).toLowerCase())
+    ) {
+      return {
+        passed: false,
+        output: `message does not contain "${String(args.messageContains)}": ${message}`
+      }
+    }
+    if (
+      args.messageNotMatching !== undefined &&
+      new RegExp(String(args.messageNotMatching), 'i').test(message)
+    ) {
+      return { passed: false, output: `message matched the forbidden pattern: ${message}` }
+    }
+    return { passed: true, output: `code=${err.code || '(none)'}: ${message.slice(0, 120)}` }
+  },
+
   loadedModelInfoShape(value, args) {
     const info = value as {
       modelId?: string

@@ -435,6 +435,8 @@ class Interpreter:
 
         if op == "useModel":
             return await self._use_model(body, scope)
+        if op == "modelSource":
+            return self._model_source(body, scope)
         if op == "call":
             return await self._call(body, scope)
         if op == "callError":
@@ -540,6 +542,14 @@ class Interpreter:
             collected.append(inner.get(_last_binding(steps) or "result"))
 
         scope[body["collectInto"]] = collected
+        return None
+
+    def _model_source(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
+        """The model source behind a resource key, without loading it."""
+        try:
+            scope[body["as"]] = self._resources.source_of(body["dep"])
+        except UnknownResourceError as error:
+            raise StepError(str(error), incomplete=True) from error
         return None
 
     async def _use_model(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
@@ -685,6 +695,8 @@ def _last_binding(steps: list[dict[str, Any]]) -> str | None:
             return step["call"].get("as") or "result"
         if "asset" in step:
             return step["asset"]["as"]
+        if "modelSource" in step:
+            return step["modelSource"]["as"]
     return None
 
 
