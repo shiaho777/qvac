@@ -1,7 +1,8 @@
 {
   "default-registry": {
     "kind": "git",
-    "baseline": "b9ca3b07a85cd88fdd30730c662b4c138ede1ca3",
+    "baseline": "5609c537ea716b1a073ccfdb5b9eb465d8780769",
+    "reference": "QVAC-25372/moss-ttsd-dialogue",
     "repository": "https://github.com/tetherto/qvac-registry-vcpkg.git"
   },
   "registries": [
