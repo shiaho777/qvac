@@ -1,6 +1,13 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import { classify, embed, getLoadedModelInfo } from '@qvac/sdk'
+import {
+  classify,
+  embed,
+  getLoadedModelInfo,
+  modelRegistryGetModel,
+  modelRegistryList,
+  modelRegistrySearch
+} from '@qvac/sdk'
 import { StepIncompleteError, type StepBindings } from '@qvac/test-suite'
 import type { ResourceManager } from './resource-manager.js'
 
@@ -28,7 +35,18 @@ import type { ResourceManager } from './resource-manager.js'
 const CALLS: Record<string, (params: never) => Promise<unknown>> = {
   embed: (params) => embed(params),
   getLoadedModelInfo: (params) => getLoadedModelInfo(params),
-  classify: async (params) => ({ results: await classify(params) })
+  classify: async (params) => ({ results: await classify(params) }),
+
+  // The registry trio takes its arguments differently in each language --
+  // positional here, keyword in Python. The contract name and the params
+  // object in the step are what both sides agree on; adapting to the local
+  // signature is precisely what a binding is for.
+  modelRegistryList: () => modelRegistryList(),
+  modelRegistrySearch: (params) => modelRegistrySearch(params),
+  modelRegistryGetModel: (params: never) => {
+    const p = params as unknown as { registryPath: string; registrySource: string }
+    return modelRegistryGetModel(p.registryPath, p.registrySource)
+  }
 }
 
 /**
@@ -82,6 +100,49 @@ const ASSERTIONS: Record<
       return { passed: false, output: `expected ${expected} element(s), got ${value.length}` }
     }
     return { passed: true, output: `${value.length} element(s)` }
+  },
+
+  /**
+   * Every named field is present on the value.
+   *
+   * Replaces the inline "which required fields are missing" loops that several
+   * executors grew independently. Generic on purpose: the field list belongs to
+   * the test, not to the assertion registry.
+   */
+  fieldsPresent(value, args) {
+    if (!value || typeof value !== 'object') {
+      return { passed: false, output: `expected an object, got ${typeof value}` }
+    }
+    const record = value as Record<string, unknown>
+    const fields = (args.fields ?? []) as string[]
+    const missing = fields.filter((field) => record[field] === undefined)
+    if (missing.length > 0) {
+      return { passed: false, output: `missing fields: ${missing.join(', ')}` }
+    }
+    return { passed: true, output: `${fields.length} field(s) present` }
+  },
+
+  /**
+   * Two records agree on the named fields.
+   *
+   * Compared as strings so a client that returns a number where another
+   * returns a numeric string is not reported as drift -- the question here is
+   * whether two views of the same record agree, not how each typed it.
+   */
+  fieldsMatch(value, args) {
+    const left = (value ?? {}) as Record<string, unknown>
+    const right = (args.expected ?? {}) as Record<string, unknown>
+    const fields = (args.fields ?? []) as string[]
+    const mismatched = fields.filter((field) => String(left[field]) !== String(right[field]))
+    if (mismatched.length > 0) {
+      return {
+        passed: false,
+        output: mismatched
+          .map((field) => `${field}: ${String(left[field])} != ${String(right[field])}`)
+          .join('; ')
+      }
+    }
+    return { passed: true, output: `${fields.length} field(s) match` }
   },
 
   loadedModelInfoShape(value, args) {

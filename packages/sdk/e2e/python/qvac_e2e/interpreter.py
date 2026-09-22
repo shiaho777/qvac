@@ -22,6 +22,9 @@ from tetherto.qvac_sdk import (
     GetLoadedModelInfoRequest,
     embed,
     get_loaded_model_info,
+    model_registry_get_model,
+    model_registry_list,
+    model_registry_search,
 )
 
 from .assertions import ASSERTIONS
@@ -29,13 +32,43 @@ from .resources import ResourceManager, UnknownResourceError
 from .result import StepResult
 from .validation import validate
 
-# method name (as it appears in the contract manifest) -> (request model, call)
+# method name (as it appears in the contract manifest) -> how to call it here.
+#
+# Each entry takes the transport and the step's already-resolved params and
+# adapts them to whatever this client's signature happens to be: a request
+# model for the generated stubs, keyword arguments for the hand-written
+# ergonomic wrappers, positional arguments for `model_registry_get_model`.
+# Adapting is the binding's whole job -- the contract name and the params
+# object are what the two clients agree on, not the calling convention.
 #
 # Deliberately explicit rather than reflective: a typo in a step should be an
 # `incomplete` with a clear reason, not an attribute error deep in a stream.
-CALLS: dict[str, tuple[Any, Callable[..., Any]]] = {
-    "embed": (EmbedRequest, embed),
-    "getLoadedModelInfo": (GetLoadedModelInfoRequest, get_loaded_model_info),
+def _request(model: Any, method: str, call: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a generated stub that takes a validated request model."""
+
+    def invoke(transport: Any, params: dict[str, Any]) -> Any:
+        return call(transport, model.model_validate({"type": method, **params}))
+
+    return invoke
+
+
+CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
+    "embed": _request(EmbedRequest, "embed", embed),
+    "getLoadedModelInfo": _request(
+        GetLoadedModelInfoRequest, "getLoadedModelInfo", get_loaded_model_info
+    ),
+    "modelRegistryList": lambda transport, params: model_registry_list(transport),
+    "modelRegistrySearch": lambda transport, params: model_registry_search(
+        transport,
+        filter=params.get("filter"),
+        engine=params.get("engine"),
+        quantization=params.get("quantization"),
+        addon=params.get("addon"),
+        model_type=params.get("modelType"),
+    ),
+    "modelRegistryGetModel": lambda transport, params: model_registry_get_model(
+        transport, params["registryPath"], params["registrySource"]
+    ),
 }
 
 # Methods whose Python surface is NOT yet the ergonomic equivalent of the JS
@@ -88,22 +121,38 @@ class Interpreter:
         await self._resources.evict_all_except(declared)
 
         scope: dict[str, Any] = {"params": params}
-        last_assert: StepResult | None = None
 
-        for step in steps:
-            try:
-                last_assert = (
-                    await self._run_step(step, scope, expectation) or last_assert
-                )
-            except StepError as error:
-                if error.incomplete:
-                    return StepResult.incomplete(str(error))
-                return StepResult.fail(str(error))
-            except Exception as error:  # noqa: BLE001 - any client error fails the test
-                return StepResult.fail(f"{type(error).__name__}: {error}")
+        try:
+            last_assert = await self._run_steps(steps, scope, expectation)
+        except StepError as error:
+            if error.incomplete:
+                return StepResult.incomplete(str(error))
+            return StepResult.fail(str(error))
+        except Exception as error:  # noqa: BLE001 - any client error fails the test
+            return StepResult.fail(f"{type(error).__name__}: {error}")
 
         if last_assert is None:
             return StepResult.fail("test body ran but asserted nothing")
+        return last_assert
+
+    async def _run_steps(
+        self,
+        steps: list[dict[str, Any]],
+        scope: dict[str, Any],
+        expectation: dict[str, Any],
+    ) -> StepResult | None:
+        last_assert: StepResult | None = None
+        for step in steps:
+            result = await self._run_step(step, scope, expectation)
+            if result is None:
+                continue
+            # The first failing check decides the test. A migrated executor
+            # often becomes several checks in a row -- shape, then length, then
+            # value -- and without this a later passing one would mask an
+            # earlier failure. Mirrors the JS interpreter.
+            if not result.passed:
+                return result
+            last_assert = result
         return last_assert
 
     async def _run_step(
@@ -143,20 +192,18 @@ class Interpreter:
         when the error stops happening is worse than no test.
         """
         method = body["method"]
-        entry = CALLS.get(method)
-        if entry is None:
+        call = CALLS.get(method)
+        if call is None:
             raise StepError(
                 f'SDK method "{method}" is not wired into the Python interpreter yet',
                 incomplete=True,
             )
 
-        request_model, call = entry
-        raw_params = self._resolve(body.get("params", {}), scope)
-        payload = {"type": method, **raw_params}
+        params = self._resolve(body.get("params", {}), scope)
 
         self._log(f"callError {method}")
         try:
-            await call(self._resources.transport, request_model.model_validate(payload))
+            await call(self._resources.transport, params)
         except Exception as error:  # noqa: BLE001 - the rejection is the subject
             scope[body["as"]] = {
                 "code": getattr(error, "code", "") or "",
@@ -182,8 +229,14 @@ class Interpreter:
             # Each iteration gets its own scope so a binding from one item
             # cannot leak into the next.
             inner = {**scope, body["as"]: item}
-            for step in steps:
-                await self._run_step(step, inner, expectation)
+            failure = await self._run_steps(steps, inner, expectation)
+            if failure is not None and not failure.passed:
+                # An iteration that failed its own check must stop the repeat
+                # rather than contribute a half-built value to `collectInto`.
+                raise StepError(
+                    failure.output or "repeat iteration failed",
+                    incomplete=failure.is_incomplete,
+                )
             collected.append(inner.get(_last_binding(steps) or "result"))
 
         scope[body["collectInto"]] = collected
@@ -208,8 +261,8 @@ class Interpreter:
 
     async def _call(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
         method = body["method"]
-        entry = CALLS.get(method)
-        if entry is None:
+        call = CALLS.get(method)
+        if call is None:
             raise StepError(
                 f'SDK method "{method}" is not wired into the Python interpreter yet',
                 incomplete=True,
@@ -225,24 +278,12 @@ class Interpreter:
         if gap:
             raise StepError(gap, incomplete=True)
 
-        request_model, call = entry
-        raw_params = self._resolve(body.get("params", {}), scope)
-        payload = {"type": method, **raw_params}
+        params = self._resolve(body.get("params", {}), scope)
 
         self._log(f"call {method}")
-        response = await call(
-            self._resources.transport, request_model.model_validate(payload)
-        )
+        response = await call(self._resources.transport, params)
 
-        # mode="json" matters: without it pydantic leaves enums and dates as
-        # Python objects. They would not serialise onto the bridge, and worse,
-        # the JS client reports plain JSON for the same field — so the
-        # cross-client value comparison would report drift that is not there.
-        result = (
-            response.model_dump(mode="json", by_alias=True)
-            if hasattr(response, "model_dump")
-            else response
-        )
+        result = _jsonable(response)
         if isinstance(result, dict) and result.get("success") is False:
             raise StepError(f"{method} failed: {result.get('error')}")
 
@@ -293,6 +334,22 @@ class Interpreter:
         if isinstance(value, list):
             return [self._resolve(v, scope) for v in value]
         return value
+
+
+def _jsonable(value: Any) -> Any:
+    """Render a response the way the JS client would report it.
+
+    mode="json" matters: without it pydantic leaves enums and dates as Python
+    objects. They would not serialise onto the bridge, and worse, the JS client
+    reports plain JSON for the same field -- so the cross-client value
+    comparison would report drift that is not there. Lists are mapped rather
+    than dumped whole, because the ergonomic wrappers return lists of models.
+    """
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json", by_alias=True)
+    return value
 
 
 def _last_binding(steps: list[dict[str, Any]]) -> str | None:

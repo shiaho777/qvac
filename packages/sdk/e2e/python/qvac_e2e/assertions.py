@@ -34,6 +34,45 @@ def length_is(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(value)} element(s)")
 
 
+def fields_present(value: Any, args: dict[str, Any]) -> StepResult:
+    """Every named field is present on the value.
+
+    Replaces the inline "which required fields are missing" loops that several
+    executors grew independently. Generic on purpose: the field list belongs to
+    the test, not to the assertion registry.
+    """
+    if not isinstance(value, dict):
+        return StepResult.fail(f"expected an object, got {type(value).__name__}")
+    fields: list[str] = args.get("fields") or []
+    missing = [field for field in fields if value.get(field) is None]
+    if missing:
+        return StepResult.fail(f"missing fields: {', '.join(missing)}")
+    return StepResult.ok(f"{len(fields)} field(s) present")
+
+
+def fields_match(value: Any, args: dict[str, Any]) -> StepResult:
+    """Two records agree on the named fields.
+
+    Compared as strings so a client that returns a number where another returns
+    a numeric string is not reported as drift -- the question here is whether
+    two views of the same record agree, not how each typed it.
+    """
+    left = value if isinstance(value, dict) else {}
+    right = args.get("expected") or {}
+    fields: list[str] = args.get("fields") or []
+    mismatched = [
+        field for field in fields if str(left.get(field)) != str(right.get(field))
+    ]
+    if mismatched:
+        return StepResult.fail(
+            "; ".join(
+                f"{field}: {left.get(field)} != {right.get(field)}"
+                for field in mismatched
+            )
+        )
+    return StepResult.ok(f"{len(fields)} field(s) match")
+
+
 def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """`getLoadedModelInfo` returned a record describing the model we loaded.
 
@@ -71,5 +110,7 @@ def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
 
 ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "lengthIs": length_is,
+    "fieldsPresent": fields_present,
+    "fieldsMatch": fields_match,
     "loadedModelInfoShape": loaded_model_info_shape,
 }
