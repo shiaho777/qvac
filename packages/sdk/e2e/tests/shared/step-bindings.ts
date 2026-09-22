@@ -517,6 +517,10 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
       return call(params as never)
     },
 
+    async modelSource(dep) {
+      return resources.sourceOf(dep)
+    },
+
     async asset(kind, file) {
       const root = ASSET_ROOTS[kind]
       if (!root) {

@@ -235,6 +235,23 @@ export class ResourceManager {
     this.testCount++
   }
 
+  /**
+   * What `loadModel` would be called with for this key, without calling it.
+   *
+   * A test that drives the load path itself needs the source as data, and the
+   * source is the one thing a definition cannot write down: it is a per-client
+   * constant. This table already knows it.
+   */
+  sourceOf(dep: string): { modelSrc?: unknown; modelType?: string; modelConfig?: unknown } {
+    const def = this.definitions.get(dep)
+    if (!def) throw new Error(`Unknown dependency: ${dep}`)
+    return {
+      ...(def.constant ? { modelSrc: def.constant } : {}),
+      ...(def.modelSrc !== undefined ? { modelSrc: def.modelSrc } : {}),
+      ...(def.type ? { modelType: def.type } : {})
+    }
+  }
+
   async ensureLoaded(dep: string): Promise<string> {
     const existing = this.models.get(dep)
     if (existing) {
