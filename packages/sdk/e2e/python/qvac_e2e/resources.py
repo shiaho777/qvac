@@ -29,7 +29,7 @@ _TABLE_PATH = Path(
 )
 
 # Where `$asset` placeholders point on this platform.
-_ASSET_ROOT = Path(
+ASSET_ROOT = Path(
     os.environ.get("QVAC_ASSET_ROOT") or Path(__file__).resolve().parents[2] / "assets"
 )
 
@@ -74,7 +74,7 @@ def _resolve(value: Any) -> Any:
             return constant
         asset = value.get("$asset")
         if isinstance(asset, dict):
-            return str(_ASSET_ROOT / asset["kind"] / asset["file"])
+            return str(ASSET_ROOT / asset["kind"] / asset["file"])
         return {key: _resolve(item) for key, item in value.items()}
     return value
 

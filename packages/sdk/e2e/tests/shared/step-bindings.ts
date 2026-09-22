@@ -163,7 +163,13 @@ type Fold = (params: never, collect: CollectMode) => Promise<unknown>
 const STREAMS: Record<string, Fold> = {
   completion: async (params, collect) => {
     const run = completion(params)
-    if (collect === 'text') return { text: await run.text }
+    // `toolCalls` rides along with `text` because a tools test needs both: the
+    // model either answered or called a tool, and which one it did is the
+    // question. Splitting them across two folds would mean running the
+    // completion twice.
+    if (collect === 'text') {
+      return { text: await run.text, toolCalls: (await run.toolCalls) ?? [] }
+    }
     if (collect === 'events') return { events: await drain(run.events) }
     if (collect === 'all') return { all: await drain(run.tokenStream) }
     throw unsupported('completion', collect)
@@ -484,6 +490,49 @@ const ASSERTIONS: Record<
     return { passed: true, output: `code=${err.code || '(none)'}: ${message.slice(0, 120)}` }
   },
 
+  /**
+   * The model made a structured tool call, and the right one.
+   *
+   * `declared` is the tools the test offered: a call naming something that was
+   * never declared is a failure however well-formed it looks, and that check
+   * is the reason this is not an ordinary field comparison.
+   */
+  toolCallShape(value, args) {
+    const calls = (Array.isArray(value) ? value : []) as Array<{
+      name?: string
+      arguments?: Record<string, unknown>
+    }>
+    if (calls.length === 0) {
+      return { passed: false, output: 'expected a structured tool call but the model made none' }
+    }
+
+    const declared = new Set((args.declared ?? []) as string[])
+    const valid = calls.filter((call) => typeof call.name === 'string' && declared.has(call.name))
+    if (valid.length === 0) {
+      return {
+        passed: false,
+        output:
+          `no tool call matched a declared tool. Got: [${calls.map((c) => c.name ?? '<unnamed>').join(', ')}], ` +
+          `declared: [${[...declared].join(', ')}]`
+      }
+    }
+
+    const match = valid.find((call) => call.name === args.name)
+    if (match) {
+      const callArgs = match.arguments ?? {}
+      for (const key of (args.argKeys ?? []) as string[]) {
+        if (!(key in callArgs)) {
+          return {
+            passed: false,
+            output: `tool call '${String(args.name)}' is missing argument '${key}': ${JSON.stringify(callArgs)}`
+          }
+        }
+      }
+    }
+
+    return { passed: true, output: `tool call(s): ${valid.map((call) => call.name).join(', ')}` }
+  },
+
   loadedModelInfoShape(value, args) {
     const info = value as {
       modelId?: string
@@ -554,7 +603,7 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
       return resources.sourceOf(dep)
     },
 
-    async asset(kind, file) {
+    async asset(kind, file, form) {
       const root = ASSET_ROOTS[kind]
       if (!root) {
         throw new StepIncompleteError(`asset kind "${kind}" is not known to these bindings`)
@@ -572,7 +621,10 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
         // A missing fixture is a real failure, not a client gap.
         throw new Error(`asset not found: ${absolute}`)
       }
-      return new Uint8Array(fs.readFileSync(absolute))
+      // On desktop the path form is a filesystem path; a mobile binding hands
+      // back a bundled-asset URI for the same pair, which is the entire reason
+      // several categories still carry two executors.
+      return form === 'path' ? absolute : new Uint8Array(fs.readFileSync(absolute))
     },
 
     assertions: ASSERTIONS,

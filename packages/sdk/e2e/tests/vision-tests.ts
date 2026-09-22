@@ -1,4 +1,38 @@
-import type { TestDefinition, Expectation } from '@qvac/test-suite'
+import type { Expectation, Step, TestDefinition } from '@qvac/test-suite'
+
+/**
+ * One image-attached completion.
+ *
+ * The `asset` step with `form: 'path'` is what collapses this category's two
+ * executors into one. They differed in exactly one thing -- `path.resolve` on
+ * desktop against a bundled-asset URI on mobile -- and resolving that is the
+ * platform's job, not the test's.
+ */
+const visionSteps = (dependency: string): Step[] => [
+  { useModel: { deps: [dependency], as: 'model' } },
+  { asset: { kind: 'image', file: '$params.image', form: 'path', as: 'image' } },
+  {
+    call: {
+      method: 'completion',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        history: [
+          {
+            role: 'user',
+            content: '$params.prompt',
+            attachments: [{ path: '$image' }]
+          }
+        ],
+        stream: '$params.stream?',
+        generationParams: '$params.generationParams?'
+      },
+      as: 'run'
+    }
+  },
+  { project: { from: '$run', path: 'text', as: 'text' } },
+  { assert: { on: '$text', use: 'expectation' } }
+]
 
 const createVisionTest = (
   testId: string,
@@ -14,6 +48,11 @@ const createVisionTest = (
 ): TestDefinition => ({
   testId,
   params: {
+    // The prompt and the image, named separately, are what the declarative
+    // body builds its history from; `history` below stays for the executors
+    // the other platforms still run.
+    prompt,
+    image: imagePath,
     history: [
       {
         role: 'user',
@@ -26,6 +65,7 @@ const createVisionTest = (
   },
   expectation,
   ...(suites && { suites }),
+  steps: visionSteps('vision'),
   metadata: {
     category: 'vision',
     dependency: 'vision',

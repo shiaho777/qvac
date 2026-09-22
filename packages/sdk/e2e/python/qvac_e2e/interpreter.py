@@ -64,7 +64,7 @@ from tetherto.qvac_sdk import (
 )
 
 from .assertions import ASSERTIONS
-from .resources import ResourceManager, UnknownResourceError
+from .resources import ASSET_ROOT, ResourceManager, UnknownResourceError
 from .result import StepResult
 from .validation import validate
 
@@ -212,7 +212,16 @@ async def _completion_stream(
         tool_dialect=params.get("toolDialect"),
     )
     if collect == "text":
-        return {"text": await run.text()}
+        # `tool_calls` rides along with the text because a tools test needs
+        # both: the model either answered or called a tool, and which one it
+        # did is the question. Two folds would mean two completions.
+        calls = await run.tool_calls()
+        return {
+            "text": await run.text(),
+            "toolCalls": [
+                {"name": call.name, "arguments": call.arguments} for call in calls
+            ],
+        }
     if collect == "events":
         return {"events": [_jsonable(event) async for event in run.events]}
     raise StepError(
@@ -437,6 +446,8 @@ class Interpreter:
             return await self._use_model(body, scope)
         if op == "modelSource":
             return self._model_source(body, scope)
+        if op == "asset":
+            return self._asset(body, scope)
         if op == "call":
             return await self._call(body, scope)
         if op == "callError":
@@ -544,10 +555,43 @@ class Interpreter:
         scope[body["collectInto"]] = collected
         return None
 
+    # Asset family -> the directory it lives in, mirroring ASSET_ROOTS in
+    # tests/shared/step-bindings.ts. Two clients only run the same test if
+    # `{ kind: "image", file: "elephant.jpg" }` means the same file on both.
+    ASSET_ROOTS = {
+        "image": "images",
+        "audio": "audio",
+        "document": "documents",
+        "neural": "neural",
+    }
+
+    def _asset(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
+        """Resolve a bundled fixture: its bytes, or a path the SDK can open."""
+        # `kind` and `file` resolve like any other value: a category whose
+        # tests differ only in which fixture they use should carry one body and
+        # name the file in its params.
+        kind = str(self._resolve(body["kind"], scope))
+        root = self.ASSET_ROOTS.get(kind)
+        if root is None:
+            raise StepError(
+                f'asset kind "{kind}" is not known to the Python client',
+                incomplete=True,
+            )
+        absolute = ASSET_ROOT / root / str(self._resolve(body["file"], scope))
+        if not absolute.exists():
+            # A missing fixture is a real failure, not a client gap.
+            raise StepError(f"asset not found: {absolute}")
+        scope[body["as"]] = (
+            str(absolute) if body.get("form") == "path" else absolute.read_bytes()
+        )
+        return None
+
     def _model_source(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
         """The model source behind a resource key, without loading it."""
         try:
-            scope[body["as"]] = self._resources.source_of(body["dep"])
+            scope[body["as"]] = self._resources.source_of(
+                str(self._resolve(body["dep"], scope))
+            )
         except UnknownResourceError as error:
             raise StepError(str(error), incomplete=True) from error
         return None

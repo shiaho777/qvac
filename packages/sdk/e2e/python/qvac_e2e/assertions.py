@@ -134,6 +134,43 @@ def error_matches(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"code={err.get('code') or '(none)'}: {message[:120]}")
 
 
+def tool_call_shape(value: Any, args: dict[str, Any]) -> StepResult:
+    """The model made a structured tool call, and the right one.
+
+    `declared` is the tools the test offered: a call naming something that was
+    never declared is a failure however well-formed it looks, and that check is
+    the reason this is not an ordinary field comparison.
+    """
+    calls = value if isinstance(value, list) else []
+    if not calls:
+        return StepResult.fail(
+            "expected a structured tool call but the model made none"
+        )
+
+    declared = set(args.get("declared") or [])
+    valid = [call for call in calls if call.get("name") in declared]
+    if not valid:
+        got = ", ".join(str(call.get("name") or "<unnamed>") for call in calls)
+        return StepResult.fail(
+            f"no tool call matched a declared tool. Got: [{got}], "
+            f"declared: [{', '.join(sorted(declared))}]"
+        )
+
+    match = next((call for call in valid if call.get("name") == args.get("name")), None)
+    if match is not None:
+        call_args = match.get("arguments") or {}
+        for key in args.get("argKeys") or []:
+            if key not in call_args:
+                return StepResult.fail(
+                    f"tool call '{args.get('name')}' is missing argument "
+                    f"'{key}': {call_args}"
+                )
+
+    return StepResult.ok(
+        "tool call(s): " + ", ".join(str(call.get("name")) for call in valid)
+    )
+
+
 def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """`getLoadedModelInfo` returned a record describing the model we loaded.
 
@@ -176,5 +213,6 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "errorIsStructured": error_is_structured,
     "nonEmptyText": non_empty_text,
     "errorMatches": error_matches,
+    "toolCallShape": tool_call_shape,
     "loadedModelInfoShape": loaded_model_info_shape,
 }
