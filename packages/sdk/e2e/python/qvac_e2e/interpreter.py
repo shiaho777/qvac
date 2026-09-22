@@ -144,6 +144,20 @@ NOT_YET_ERGONOMIC: dict[str, str] = {
 _INDEX = re.compile(r"^(.*?)\[(\d+)\]$")
 
 
+class _Missing:
+    """An optional reference that resolved to nothing.
+
+    Distinct from None so a step can still pass an explicit null where the
+    contract has one.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<missing>"
+
+
+_MISSING = _Missing()
+
+
 class StepError(Exception):
     """A step could not run. Carries whether that is a failure or a gap."""
 
@@ -253,7 +267,7 @@ class Interpreter:
                 incomplete=True,
             )
 
-        params = self._resolve(body.get("params", {}), scope)
+        params = self._call_params(body.get("params"), scope)
 
         self._log(f"callError {method}")
         try:
@@ -348,7 +362,10 @@ class Interpreter:
     async def _call(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
         method = body["method"]
         call = CALLS.get(method)
-        if call is None:
+        collect = body.get("collect")
+        # A streaming method lives in STREAMS, not CALLS, so a step that asks
+        # for a fold must be allowed through even though CALLS has no entry.
+        if call is None and (not collect or method not in STREAMS):
             raise StepError(
                 f'SDK method "{method}" is not wired into the Python interpreter yet',
                 incomplete=True,
@@ -357,8 +374,7 @@ class Interpreter:
         if gap:
             raise StepError(gap, incomplete=True)
 
-        params = self._resolve(body.get("params", {}), scope)
-        collect = body.get("collect")
+        params = self._call_params(body.get("params"), scope)
 
         self._log(f"call {method}")
         response = await self._invoke(method, call, params, collect)
@@ -405,9 +421,34 @@ class Interpreter:
         result.asserted_value = value
         return result
 
+    def _call_params(
+        self, params: dict[str, Any] | None, scope: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve a call's parameters, dropping the ones that resolved to nothing.
+
+        An optional reference that is not there must leave the argument out
+        entirely, not pass it as None: an SDK that distinguishes "absent" from
+        "explicitly nothing" would otherwise see a different call than the test
+        meant to make, and the two clients would have to agree on which.
+        """
+        resolved = self._resolve(params or {}, scope)
+        return {k: v for k, v in resolved.items() if v is not _MISSING}
+
     def _resolve(self, value: Any, scope: dict[str, Any]) -> Any:
-        """Replace `$name` / `$params.x` references, recursively."""
+        """Replace `$name` / `$params.x` references, recursively.
+
+        A trailing `?` marks the reference optional: a path that is not there
+        resolves to the missing marker instead of failing the step. Most calls
+        in the catalog take optional arguments, and without this every test
+        would have to restate its own params inside its steps just to leave one
+        of them out.
+        """
         if isinstance(value, str) and value.startswith("$"):
+            if value.endswith("?"):
+                try:
+                    return _walk(scope, value[1:-1])
+                except StepError:
+                    return _MISSING
             return _walk(scope, value[1:])
         if isinstance(value, dict):
             return {k: self._resolve(v, scope) for k, v in value.items()}

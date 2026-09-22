@@ -1,5 +1,5 @@
 // Completion test definitions
-import type { TestDefinition } from '@qvac/test-suite'
+import type { Step, TestDefinition } from '@qvac/test-suite'
 
 interface GenerationParams {
   temp?: number
@@ -55,24 +55,90 @@ interface CompletionTestOptions {
   dependency?: 'llm' | 'llm-batch' | 'llm-small-ctx' | 'none'
 }
 
+/**
+ * The declarative body every plain completion test has.
+ *
+ * `collect: 'text'` names the fold: the completion's final content text. Both
+ * clients resolve it the same way -- JS awaits the run's `text`, Python awaits
+ * `final.content_text` -- so "the text of this completion" means one thing
+ * across languages. A test that cares about the deltas themselves rather than
+ * the text asks for `collect: 'events'` instead.
+ *
+ * The optional `?` references leave an argument out when the test does not set
+ * it, rather than passing it as null. An SDK that tells "absent" apart from
+ * "explicitly nothing" would otherwise see a different call than the test meant
+ * to make.
+ */
+const completionSteps = (dependency: string): Step[] => [
+  { useModel: { deps: [dependency], as: 'model' } },
+  {
+    call: {
+      method: 'completion',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        history: '$params.history',
+        stream: '$params.stream?',
+        stopSequences: '$params.stopSequences?',
+        responseFormat: '$params.responseFormat?',
+        tools: '$params.tools?',
+        generationParams: '$params.generationParams?'
+      },
+      as: 'run'
+    }
+  },
+  { project: { from: '$run', path: 'text', as: 'text' } },
+  { assert: { on: '$text', use: 'expectation' } }
+]
+
+/**
+ * Tests whose body is more than one call, left on the executor for now.
+ *
+ * Each needs something the vocabulary does not have yet -- several completions
+ * in flight at once, a second turn against a warm cache, a read of the run's
+ * stats rather than its text. They are named here rather than detected so that
+ * what is still executor-only is a list someone can read, not a switch
+ * statement to reverse-engineer.
+ */
+const NOT_YET_DECLARATIVE = new Set([
+  'completion-response-format-json-object',
+  'completion-response-format-json-object-streaming',
+  'completion-response-format-json-schema',
+  'completion-response-format-with-tools-rejected',
+  'completion-stats',
+  'completion-concurrent-requests',
+  'completion-concurrent-overlap',
+  'completion-seed-reproducibility',
+  'completion-stop-reason-length',
+  'completion-context-boundary-stop',
+  'completion-context-overflow-prefill',
+  'completion-context-overflow-warm-cache'
+])
+
 // Helper for creating completion tests with common structure
 const createCompletionTest = (
   testId: string,
   params: CompletionTestParams,
   expectation: CompletionExpectation,
   options: CompletionTestOptions = {}
-): TestDefinition => ({
-  testId,
-  params,
-  expectation,
-  ...(options.suites && { suites: options.suites }),
-  ...(options.skip && { skip: options.skip }),
-  metadata: {
-    category: 'completion',
-    dependency: options.dependency ?? 'llm',
-    estimatedDurationMs: options.estimatedDurationMs ?? 10000
+): TestDefinition => {
+  const dependency = options.dependency ?? 'llm'
+  return {
+    testId,
+    params,
+    expectation,
+    ...(options.suites && { suites: options.suites }),
+    ...(options.skip && { skip: options.skip }),
+    ...(NOT_YET_DECLARATIVE.has(testId) || dependency === 'none'
+      ? {}
+      : { steps: completionSteps(dependency) }),
+    metadata: {
+      category: 'completion',
+      dependency,
+      estimatedDurationMs: options.estimatedDurationMs ?? 10000
+    }
   }
-})
+}
 
 // Basic completion tests
 export const completionStreaming = createCompletionTest(
