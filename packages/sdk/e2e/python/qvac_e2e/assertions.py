@@ -73,6 +73,25 @@ def fields_match(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(fields)} field(s) match")
 
 
+def error_is_structured(value: Any, args: dict[str, Any]) -> StepResult:
+    """The rejection carried machine-readable structure, not just a string.
+
+    A chained cause or a present error code both answer that; which one a given
+    SDK surfaces is an implementation choice, and pinning the test to one of
+    them would make it a test of that choice rather than of the guarantee.
+    """
+    err = value if isinstance(value, dict) else {}
+    code = err.get("code") or ""
+    if not code and not err.get("hasCause"):
+        return StepResult.fail(
+            "rejection carried neither a code nor a cause: "
+            f"{err.get('message') or '(no message)'}"
+        )
+    return StepResult.ok(
+        f"hasCause={bool(err.get('hasCause'))}, code={code or '(none)'}"
+    )
+
+
 def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """`getLoadedModelInfo` returned a record describing the model we loaded.
 
@@ -112,5 +131,6 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "lengthIs": length_is,
     "fieldsPresent": fields_present,
     "fieldsMatch": fields_match,
+    "errorIsStructured": error_is_structured,
     "loadedModelInfoShape": loaded_model_info_shape,
 }

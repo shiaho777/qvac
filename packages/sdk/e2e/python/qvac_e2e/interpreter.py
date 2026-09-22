@@ -20,8 +20,11 @@ from typing import Any
 from tetherto.qvac_sdk import (
     EmbedRequest,
     GetLoadedModelInfoRequest,
+    completion,
+    delete_cache,
     embed,
     get_loaded_model_info,
+    load_model,
     model_registry_get_model,
     model_registry_list,
     model_registry_search,
@@ -69,6 +72,56 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "modelRegistryGetModel": lambda transport, params: model_registry_get_model(
         transport, params["registryPath"], params["registrySource"]
     ),
+    "loadModel": lambda transport, params: load_model(
+        transport,
+        model_src=params.get("modelSrc"),
+        model_type=params.get("modelType"),
+        model_config=params.get("modelConfig"),
+        model_name=params.get("modelName"),
+        model_id=params.get("modelId"),
+    ),
+    "deleteCache": lambda transport, params: delete_cache(
+        transport,
+        all=params.get("all"),
+        auto=params.get("auto"),
+        kv_cache_key=params.get("kvCacheKey"),
+        model_id=params.get("modelId"),
+    ),
+}
+
+
+async def _completion_stream(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
+    """Fold a completion the way `collect` asks for.
+
+    The fold is the interesting half of a streaming binding: two clients are
+    only running the same test if "the text of this completion" means the same
+    thing on both. Kept beside the JS fold in `tests/shared/step-bindings.ts`
+    so a divergence is a one-line diff rather than an archaeology exercise.
+    """
+    run = completion(
+        transport,
+        model_id=params["modelId"],
+        history=params["history"],
+        stream=params.get("stream", True),
+        generation_params=params.get("generationParams"),
+        tools=params.get("tools"),
+        response_format=params.get("responseFormat"),
+    )
+    if collect == "text":
+        return {"text": await run.text()}
+    if collect == "events":
+        return {"events": [_jsonable(event) async for event in run.events]}
+    raise StepError(
+        f'collect: "{collect}" is not defined for completion', incomplete=True
+    )
+
+
+# Methods whose result is a stream handle rather than a value. A step reaches
+# these through `collect`, which names the fold it wants.
+STREAMS: dict[str, Callable[[Any, dict[str, Any], str], Any]] = {
+    "completion": _completion_stream,
 }
 
 # Methods whose Python surface is NOT yet the ergonomic equivalent of the JS
@@ -193,7 +246,8 @@ class Interpreter:
         """
         method = body["method"]
         call = CALLS.get(method)
-        if call is None:
+        collect = body.get("collect")
+        if call is None and (not collect or method not in STREAMS):
             raise StepError(
                 f'SDK method "{method}" is not wired into the Python interpreter yet',
                 incomplete=True,
@@ -203,15 +257,47 @@ class Interpreter:
 
         self._log(f"callError {method}")
         try:
-            await call(self._resources.transport, params)
+            await self._invoke(method, call, params, collect)
+        except StepError:
+            raise
         except Exception as error:  # noqa: BLE001 - the rejection is the subject
+            code = getattr(error, "code", None)
+            # `hasCause` and a present `code` are what an "errors are
+            # structured" test asks about. Binding them here keeps that
+            # question answerable without a step that reaches into a
+            # language's exception object.
             scope[body["as"]] = {
-                "code": getattr(error, "code", "") or "",
+                "code": "" if code is None else str(code),
                 "message": str(error),
+                "hasCause": error.__cause__ is not None,
             }
             return None
 
         raise StepError(f"{method} was expected to fail but resolved")
+
+    async def _invoke(
+        self,
+        method: str,
+        call: Callable[[Any, dict[str, Any]], Any] | None,
+        params: dict[str, Any],
+        collect: str | None,
+    ) -> Any:
+        """One call, folded if the step asked for a fold."""
+        if collect:
+            stream = STREAMS.get(method)
+            if stream is None:
+                raise StepError(
+                    f'SDK method "{method}" has no stream fold in the Python '
+                    "interpreter yet",
+                    incomplete=True,
+                )
+            return await stream(self._resources.transport, params, collect)
+        if call is None:
+            raise StepError(
+                f'SDK method "{method}" is not wired into the Python interpreter yet',
+                incomplete=True,
+            )
+        return await call(self._resources.transport, params)
 
     async def _repeat(
         self,
@@ -267,21 +353,15 @@ class Interpreter:
                 f'SDK method "{method}" is not wired into the Python interpreter yet',
                 incomplete=True,
             )
-        if body.get("collect"):
-            raise StepError(
-                f'collect: "{body["collect"]}" is not implemented by the Python '
-                "interpreter yet (no stream folds until the wrappers land)",
-                incomplete=True,
-            )
-
         gap = NOT_YET_ERGONOMIC.get(method)
         if gap:
             raise StepError(gap, incomplete=True)
 
         params = self._resolve(body.get("params", {}), scope)
+        collect = body.get("collect")
 
         self._log(f"call {method}")
-        response = await call(self._resources.transport, params)
+        response = await self._invoke(method, call, params, collect)
 
         result = _jsonable(response)
         if isinstance(result, dict) and result.get("success") is False:

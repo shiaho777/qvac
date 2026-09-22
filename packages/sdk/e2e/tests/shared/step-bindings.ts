@@ -2,13 +2,18 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import {
   classify,
+  completion,
+  deleteCache,
   embed,
   getLoadedModelInfo,
+  loadModel,
   modelRegistryGetModel,
   modelRegistryList,
-  modelRegistrySearch
+  modelRegistrySearch,
+  ragIngest,
+  transcribe
 } from '@qvac/sdk'
-import { StepIncompleteError, type StepBindings } from '@qvac/test-suite'
+import { StepIncompleteError, type CollectMode, type StepBindings } from '@qvac/test-suite'
 import type { ResourceManager } from './resource-manager.js'
 
 /**
@@ -46,6 +51,31 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
   modelRegistryGetModel: (params: never) => {
     const p = params as unknown as { registryPath: string; registrySource: string }
     return modelRegistryGetModel(p.registryPath, p.registrySource)
+  },
+
+  loadModel: (params) => loadModel(params),
+  deleteCache: (params) => deleteCache(params),
+  ragIngest: (params) => ragIngest(params),
+  transcribe: (params) => transcribe(params)
+}
+
+/**
+ * Methods whose result is a stream handle rather than a value.
+ *
+ * A step reaches these through `collect`, which names the fold it wants. The
+ * fold is the interesting part of the binding: two clients are only running
+ * the same test if "the text of this completion" means the same thing on both.
+ */
+const STREAMS: Record<string, (params: never, collect: CollectMode) => Promise<unknown>> = {
+  completion: async (params, collect) => {
+    const run = completion(params)
+    if (collect === 'text') return { text: await run.text }
+    if (collect === 'events') {
+      const events: unknown[] = []
+      for await (const event of run.events) events.push(event)
+      return { events }
+    }
+    throw new StepIncompleteError(`collect: "${collect}" is not defined for completion`)
   }
 }
 
@@ -145,6 +175,29 @@ const ASSERTIONS: Record<
     return { passed: true, output: `${fields.length} field(s) match` }
   },
 
+  /**
+   * The rejection carried machine-readable structure, not just a string.
+   *
+   * A chained cause or a present error code both answer that; which one a
+   * given SDK surfaces is an implementation choice, and pinning the test to
+   * one of them would make it a test of that choice rather than of the
+   * guarantee.
+   */
+  errorIsStructured(value) {
+    const err = (value ?? {}) as { code?: string; hasCause?: boolean; message?: string }
+    const hasCode = typeof err.code === 'string' && err.code.length > 0
+    if (!hasCode && !err.hasCause) {
+      return {
+        passed: false,
+        output: `rejection carried neither a code nor a cause: ${err.message ?? '(no message)'}`
+      }
+    }
+    return {
+      passed: true,
+      output: `hasCause=${Boolean(err.hasCause)}, code=${err.code || '(none)'}`
+    }
+  },
+
   loadedModelInfoShape(value, args) {
     const info = value as {
       modelId?: string
@@ -193,12 +246,15 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
 
     async call(method, params, collect) {
       if (collect) {
-        // Stream folds are not part of the first vocabulary slice. This is a
-        // gap in the bindings, not a failing test, so say so explicitly — a
-        // plain Error would be reported as a failure.
-        throw new StepIncompleteError(
-          `collect: "${collect}" is not implemented by these bindings yet`
-        )
+        const stream = STREAMS[method]
+        if (!stream) {
+          // A gap in the bindings, not a failing test, so say so explicitly —
+          // a plain Error would be reported as a failure.
+          throw new StepIncompleteError(
+            `SDK method "${method}" has no stream fold in these bindings yet`
+          )
+        }
+        return stream(params as never, collect)
       }
       const call = CALLS[method]
       if (!call) {
