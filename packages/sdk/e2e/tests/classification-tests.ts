@@ -129,6 +129,24 @@ export const classificationTopK = createClassificationTest(
   ['smoke']
 )
 
+// The first migrated test that needs an asset. `asset` is what collapses the
+// node/ vs mobile/ executor split for image tests: the definition names the
+// image, and each client resolves it the way its platform can — a filesystem
+// path here, a bundled-asset URI on mobile.
+classificationTopK.steps = [
+  { useModel: { deps: ['classification'], as: 'model' } },
+  { asset: { kind: 'image', file: 'elephant.jpg', as: 'image' } },
+  {
+    call: {
+      method: 'classify',
+      params: { modelId: '$model', image: '$image', topK: '$params.topK' },
+      as: 'response'
+    }
+  },
+  { project: { from: '$response', path: 'results', as: 'results' } },
+  { assert: { on: '$results', named: 'lengthIs', with: { length: '$params.topK' } } }
+]
+
 // An invalid image buffer (too small to decode as JPEG/PNG) must reject
 // cleanly, and the model must remain usable for a follow-up valid call —
 // proves the addon does not wedge on the rejection path.

@@ -1,4 +1,5 @@
 import { createExecutor, SkipExecutor, type TestDefinition } from '@qvac/test-suite'
+import { createStepBindings } from '../shared/step-bindings.js'
 import {
   profiler,
   LLAMA_3_2_1B_INST_Q4_0,
@@ -686,6 +687,8 @@ export async function bootstrap(filteredTests?: TestDefinition[]) {
   await resources.downloadAllOnce(console.log, { allowedDeps })
 }
 
+const stepBindings = createStepBindings(resources)
+
 export const executor = createExecutor({
   handlers: [
     new SkipExecutor(
@@ -748,3 +751,9 @@ export const executor = createExecutor({
     exportData: () => profiler.exportJSON()
   }
 })
+
+// A definition carrying `steps` is run by the shared interpreter instead of the
+// executor above. That is what makes JS the reference implementation rather
+// than merely the first one: the same interpreter, over the same catalog, as
+// every other client. Definitions without `steps` are untouched.
+executor.stepBindings = stepBindings
