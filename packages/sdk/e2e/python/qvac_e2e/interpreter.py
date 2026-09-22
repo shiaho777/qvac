@@ -36,6 +36,7 @@ from .resources import ResourceManager, UnknownResourceError
 from .result import StepResult
 from .validation import validate
 
+
 # method name (as it appears in the contract manifest) -> how to call it here.
 #
 # Each entry takes the transport and the step's already-resolved params and
@@ -119,7 +120,9 @@ async def _completion_stream(
     )
 
 
-async def _translate_stream(transport: Any, params: dict[str, Any], collect: str) -> Any:
+async def _translate_stream(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
     if collect != "text":
         raise StepError(
             f'collect: "{collect}" is not defined for translate', incomplete=True
