@@ -23,6 +23,23 @@ import json
 from .result import StepResult
 
 
+def _is_integer(value: Any) -> bool:
+    """JS's `Number.isInteger`, not Python's `isinstance(x, int)`.
+
+    The two disagree on exactly the values that cross the wire here. A JSON
+    `0` stays the number 0 in JS, while the generated Pydantic models type
+    several of these fields as `float`, so Python sees `0.0` -- an integer
+    value that is not an `int` instance. Asserting membership of `int` would
+    fail the Python client for a difference that only exists in how each
+    client's own deserializer spells a whole number.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and value.is_integer()
+
+
 def length_is(value: Any, args: dict[str, Any]) -> StepResult:
     """The collection has exactly the expected number of elements.
 
@@ -333,9 +350,7 @@ def json_object_shape(value: Any, args: dict[str, Any]) -> StepResult:
             return StepResult.fail(
                 f"{field} must be a non-empty string, got {measured!r}"
             )
-        if kind == "integer" and (
-            not isinstance(measured, int) or isinstance(measured, bool)
-        ):
+        if kind == "integer" and not _is_integer(measured):
             return StepResult.fail(f"{field} must be an integer, got {measured!r}")
         if kind == "number" and (
             not isinstance(measured, (int, float)) or isinstance(measured, bool)
@@ -487,7 +502,7 @@ def transcript_segments_shape(value: Any, args: dict[str, Any]) -> StepResult:
         if not isinstance(segment.get("append"), bool):
             return StepResult.fail(f"segment {index}: missing/invalid append")
         segment_id = segment.get("id")
-        if not isinstance(segment_id, int) or isinstance(segment_id, bool):
+        if not _is_integer(segment_id):
             return StepResult.fail(f"segment {index}: missing/invalid id")
         for flag in flags:
             if not isinstance(segment.get(flag), bool):
@@ -1063,7 +1078,7 @@ def positive_integers(value: Any, args: dict[str, Any]) -> StepResult:
     fields: list[str] = args.get("fields") or []
     for field in fields:
         measured = record.get(field)
-        if not isinstance(measured, int) or isinstance(measured, bool) or measured <= 0:
+        if not _is_integer(measured) or measured <= 0:
             return StepResult.fail(
                 f"{field} is not a positive integer (got {measured!r})"
             )
