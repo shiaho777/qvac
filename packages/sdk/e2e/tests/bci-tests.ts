@@ -117,7 +117,19 @@ export const bciTranscribeMissingFile: TestDefinition = {
         as: 'err'
       }
     },
-    { assert: { on: '$err', named: 'errorIsStructured' } }
+    // The message, not the structure. This refusal is a bare ENOENT with
+    // neither a code nor a cause -- worth fixing in the SDK, but asserting
+    // structure here would fail the test for a gap the executor never claimed
+    // to check: its expectation was `errorContains: ''`, which matches
+    // anything at all.
+    { project: { from: '$err', path: 'message', as: 'message' } },
+    {
+      assert: {
+        on: '$message',
+        named: 'containsAll',
+        with: { terms: ['does-not-exist.bin'] }
+      }
+    }
   ],
   metadata: {
     category: 'bci',

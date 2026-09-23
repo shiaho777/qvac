@@ -137,6 +137,42 @@ export const indictransEnHiBatchBasic: TestDefinition = {
   testId: 'translation-indictrans-en-hi-batch-basic',
   params: { texts: ['Good morning', 'Good night'], resource: 'indictrans-en-hi' },
   expectation: { validation: 'type', expectedType: 'string' },
+  // Same three claims as the Bergamot batch: one entry per input, none empty,
+  // and the run's `text` is exactly those entries joined.
+  steps: [
+    { useModel: { deps: ['indictrans-en-hi'], as: 'model' } },
+    {
+      call: {
+        method: 'translate',
+        collect: 'text',
+        params: {
+          modelId: '$model',
+          text: '$params.texts',
+          modelType: 'nmtcpp-translation',
+          stream: false
+        },
+        as: 'run'
+      }
+    },
+    { project: { from: '$run', path: 'translations', as: 'translations' } },
+    { assert: { on: '$translations', named: 'lengthIs', with: { length: 2 } } },
+    {
+      repeat: {
+        over: '$translations',
+        as: 'entry',
+        collectInto: 'checked',
+        steps: [{ assert: { on: '$entry', named: 'nonEmptyText' } }]
+      }
+    },
+    { project: { from: '$run', path: 'text', as: 'text' } },
+    {
+      assert: {
+        on: '$text',
+        named: 'equalsJoined',
+        with: { parts: '$translations', separator: '\n' }
+      }
+    }
+  ],
   metadata: {
     category: 'translation-indictrans',
     dependency: 'indictrans-en-hi',

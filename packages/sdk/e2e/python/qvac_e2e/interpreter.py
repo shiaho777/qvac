@@ -18,6 +18,7 @@ import base64
 import math
 import shutil
 import tempfile
+import time
 import re
 import sys
 from array import array
@@ -66,7 +67,9 @@ from tetherto.qvac_sdk import (
     state,
     suspend,
     transcribe,
+    SDK_LOG_ID,
     bci_transcribe_stream_session,
+    logging_stream,
     transcribe_stream_session,
     audio_edit,
     audio_gen,
@@ -227,6 +230,84 @@ async def _transcribe_stream_write_chunks(
         session.write(speech[offset : offset + chunk_size])
         written += 1
     return {"chunks": written}
+
+
+#: Open log streams, by an id this client hands out. Kept in step with the JS
+#: bindings: three steps rather than one, because the stream has to be open
+#: before the operation that produces the logs runs, the cutoff has to be taken
+#: when that operation starts -- otherwise buffered load logs satisfy the target
+#: on their own -- and only then can the reading be bounded.
+_LOGGING_STREAMS: dict[str, dict[str, Any]] = {}
+_LOGGING_STREAM_SEQ = 0
+
+
+def _logging_state(stream_id: str) -> dict[str, Any]:
+    state = _LOGGING_STREAMS.get(stream_id)
+    if state is None:
+        raise StepError(f'log stream "{stream_id}" is not open')
+    return state
+
+
+async def _logging_stream_open(transport: Any, params: dict[str, Any]) -> Any:
+    global _LOGGING_STREAM_SEQ
+    target_id = params.get("id") or SDK_LOG_ID
+    _LOGGING_STREAM_SEQ += 1
+    stream_id = f"logs-{_LOGGING_STREAM_SEQ}"
+    state: dict[str, Any] = {"collected": [], "cutoffMs": 0, "done": False}
+    _LOGGING_STREAMS[stream_id] = state
+
+    async def pump() -> None:
+        try:
+            async for entry in logging_stream(transport, target_id):
+                if state["done"]:
+                    break
+                state["collected"].append(_jsonable(entry))
+        except Exception:  # noqa: BLE001 - an unknown id just closes the stream
+            pass
+
+    # Read in the background: the catalog triggers the operation between this
+    # step and the collect, and nothing would be listening in between.
+    state["pump"] = asyncio.ensure_future(pump())
+    return {"streamId": stream_id}
+
+
+async def _logging_stream_mark(transport: Any, params: dict[str, Any]) -> Any:
+    """Marks the point the logs are counted from."""
+    state = _logging_state(params["streamId"])
+    state["cutoffMs"] = time.time() * 1000
+    return {"markedAt": state["cutoffMs"]}
+
+
+async def _logging_stream_collect(transport: Any, params: dict[str, Any]) -> Any:
+    """Reads until enough entries arrive past the mark, or the window closes.
+
+    The window is a bound, not a wait: a test that got its entries early
+    returns as soon as it has them.
+    """
+    state = _logging_state(params["streamId"])
+    target = int(params.get("target") or 1)
+    deadline = time.monotonic() + (float(params.get("timeoutMs") or 5000) / 1000)
+
+    def since() -> list[Any]:
+        return [
+            entry
+            for entry in state["collected"]
+            if (entry or {}).get("timestamp", 0) >= state["cutoffMs"]
+        ]
+
+    while len(since()) < target and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    return {"entries": since()}
+
+
+async def _logging_stream_close(transport: Any, params: dict[str, Any]) -> Any:
+    """Closes the stream, on both paths."""
+    stream_id = params.get("streamId")
+    state = _LOGGING_STREAMS.pop(stream_id, None) if stream_id else None
+    if state is None:
+        return {"closed": False}
+    state["done"] = True
+    return {"closed": True}
 
 
 async def _bci_transcribe_stream_open(transport: Any, params: dict[str, Any]) -> Any:
@@ -659,6 +740,10 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "transcribeStreamOpen": _transcribe_stream_open,
     "transcribeStreamWrite": _transcribe_stream_write,
     "transcribeStreamWriteChunks": _transcribe_stream_write_chunks,
+    "loggingStreamOpen": _logging_stream_open,
+    "loggingStreamMark": _logging_stream_mark,
+    "loggingStreamCollect": _logging_stream_collect,
+    "loggingStreamClose": _logging_stream_close,
     "bciTranscribeStreamOpen": _bci_transcribe_stream_open,
     "transcribeStreamWriteBytes": _transcribe_stream_write_bytes,
     "transcribeStreamEnd": _transcribe_stream_end,

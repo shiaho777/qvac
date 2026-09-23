@@ -8,6 +8,8 @@ import {
   batchCompletion,
   bciTranscribe,
   bciTranscribeStream,
+  loggingStream,
+  SDK_LOG_ID,
   cancel,
   classify,
   completion,
@@ -274,6 +276,74 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
       written++
     }
     return { chunks: written }
+  },
+
+  /**
+   * Opens a log stream and starts buffering.
+   *
+   * Three steps rather than one, because the executors were three things: the
+   * stream has to be open before the operation that produces the logs runs,
+   * the cutoff has to be taken when that operation starts -- otherwise
+   * buffered load logs satisfy the target on their own -- and only then can
+   * the reading be bounded.
+   */
+  loggingStreamOpen: async (params: never) => {
+    const p = params as { id?: string }
+    const id = p.id ?? SDK_LOG_ID
+    const collected: LogEntry[] = []
+    const streamId = `logs-${++loggingStreamSeq}`
+    const state: LoggingStream = { collected, cutoffMs: 0, done: false }
+    LOGGING_STREAMS.set(streamId, state)
+    // Read in the background: the catalog triggers the operation between this
+    // step and the collect, and nothing would be listening in between.
+    state.pump = (async () => {
+      try {
+        for await (const entry of loggingStream({ id })) {
+          if (state.done) break
+          collected.push(entry as LogEntry)
+        }
+      } catch {
+        // An unknown id closes the stream; the collect step reports the count,
+        // which for that case is the assertion.
+      }
+    })()
+    return { streamId }
+  },
+
+  /** Marks the point the logs are counted from. */
+  loggingStreamMark: async (params: never) => {
+    const state = loggingStreamState((params as { streamId: string }).streamId)
+    state.cutoffMs = Date.now()
+    return { markedAt: state.cutoffMs }
+  },
+
+  /**
+   * Reads until enough entries have arrived past the mark, or the window
+   * closes.
+   *
+   * The window is a bound, not a wait: a test that got its entries early
+   * returns as soon as it has them.
+   */
+  loggingStreamCollect: async (params: never) => {
+    const p = params as { streamId: string; target?: number; timeoutMs?: number }
+    const state = loggingStreamState(p.streamId)
+    const target = p.target ?? 1
+    const deadline = Date.now() + (p.timeoutMs ?? 5000)
+    const since = () => state.collected.filter((entry) => entry.timestamp >= state.cutoffMs)
+    while (since().length < target && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    return { entries: since() }
+  },
+
+  /** Closes the stream, on both paths. */
+  loggingStreamClose: async (params: never) => {
+    const streamId = (params as { streamId?: string }).streamId
+    const state = streamId ? LOGGING_STREAMS.get(streamId) : undefined
+    if (!state) return { closed: false }
+    state.done = true
+    LOGGING_STREAMS.delete(streamId as string)
+    return { closed: true }
   },
 
   /**
@@ -741,6 +811,26 @@ const ASSET_ROOTS: Record<string, string> = {
   neural: 'assets/neural'
 }
 
+/** One entry of the log stream, as both clients report it. */
+type LogEntry = { timestamp: number; level: string; namespace: string; message: string }
+
+type LoggingStream = {
+  collected: LogEntry[]
+  cutoffMs: number
+  done: boolean
+  pump?: Promise<void>
+}
+
+/** Open log streams, by an id this client hands out. */
+const LOGGING_STREAMS = new Map<string, LoggingStream>()
+let loggingStreamSeq = 0
+
+const loggingStreamState = (streamId: string): LoggingStream => {
+  const state = LOGGING_STREAMS.get(streamId)
+  if (!state) throw new Error(`log stream "${streamId}" is not open`)
+  return state
+}
+
 /**
  * Open transcription sessions, by an id this client hands out.
  *
@@ -1195,6 +1285,28 @@ const ASSERTIONS: Record<
       passed: true,
       output: `${events.length} event(s) across ${phases.size} phase(s), no batch gaps`
     }
+  },
+
+  /**
+   * The list is ordered by the named field, smallest first.
+   *
+   * Log timestamps: entries arriving out of order would make every
+   * time-ordered read of a log stream wrong, without any single entry looking
+   * wrong.
+   */
+  sortedAscendingBy(value, args) {
+    const items = (Array.isArray(value) ? value : []) as Array<Record<string, unknown>>
+    const field = String(args.field)
+    const minimum = Number(args.minimum ?? 2)
+    if (items.length < minimum) {
+      return { passed: false, output: `need at least ${minimum} element(s), got ${items.length}` }
+    }
+    for (let i = 1; i < items.length; i++) {
+      if (Number(items[i]?.[field]) < Number(items[i - 1]?.[field])) {
+        return { passed: false, output: `out of order by ${field} at index ${i}` }
+      }
+    }
+    return { passed: true, output: `${items.length} element(s) in order` }
   },
 
   /**

@@ -196,6 +196,25 @@ def no_progress_batch_gaps(value: Any, _args: dict[str, Any]) -> StepResult:
     )
 
 
+def sorted_ascending_by(value: Any, args: dict[str, Any]) -> StepResult:
+    """The list is ordered by the named field, smallest first.
+
+    Log timestamps: entries arriving out of order would make every time-ordered
+    read of a log stream wrong, without any single entry looking wrong.
+    """
+    items = value if isinstance(value, list) else []
+    field = str(args.get("field"))
+    minimum = int(args.get("minimum", 2))
+    if len(items) < minimum:
+        return StepResult.fail(f"need at least {minimum} element(s), got {len(items)}")
+    for index in range(1, len(items)):
+        current = (items[index] or {}).get(field) or 0
+        previous = (items[index - 1] or {}).get(field) or 0
+        if current < previous:
+            return StepResult.fail(f"out of order by {field} at index {index}")
+    return StepResult.ok(f"{len(items)} element(s) in order")
+
+
 def any_element_positive(value: Any, args: dict[str, Any]) -> StepResult:
     """At least one element reports a finite, positive value for this field.
 
@@ -1112,6 +1131,7 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "transcriptSegmentsShape": transcript_segments_shape,
     "noPartialDownloads": no_partial_downloads,
     "anyElementPositive": any_element_positive,
+    "sortedAscendingBy": sorted_ascending_by,
     "noProgressBatchGaps": no_progress_batch_gaps,
     "framesAre": frames_are,
     "safetensorsContainer": safetensors_container,
