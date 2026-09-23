@@ -162,6 +162,21 @@ export const RESOURCE_TABLE: ResourceTable = {
     skipPreDownload: true
   },
 
+  /**
+   * The embedding model the multi-GPU split tests load.
+   *
+   * They loaded it from the SDK constant directly, so it was never in this
+   * table; a declarative body addresses a model through its resource key, and
+   * a key is also what keeps "which model does this test use" answerable from
+   * the catalog. Not pre-downloaded: the tests that need it are skipped
+   * wherever there is not more than one GPU.
+   */
+  'multi-gpu-embeddings': {
+    constant: { $const: 'EMBEDDINGGEMMA_300M_Q8_0' },
+    type: 'llamacpp-embedding',
+    skipPreDownload: true
+  },
+
   'sharded-embeddings': {
     constant: { $const: 'GTE_LARGE_335M_FP16_SHARD' },
     type: 'llamacpp-embedding',

@@ -97,6 +97,30 @@ from .validation import validate
 #
 # Deliberately explicit rather than reflective: a typo in a step should be an
 # `incomplete` with a clear reason, not an attribute error deep in a stream.
+async def _vector_index_search(transport: Any, params: dict[str, Any]) -> Any:
+    """One query against an index, folded the way JS folds it.
+
+    The wire takes a list of queries and answers a list of result lists. JS's
+    handle unwraps the single-query case before the caller ever sees it, so
+    the fold happens here too -- otherwise `$hits[0].id` would mean the first
+    hit on one client and the first query's whole result list on the other.
+    """
+    request = VectorIndexRequest.model_validate(
+        {
+            "type": "vectorIndex",
+            "operation": "search",
+            "indexId": params["indexId"],
+            "queries": [params["query"]],
+            "k": params["k"],
+        }
+    )
+    response = await vector_index(transport, request)
+    envelope = response.model_dump(mode="json", by_alias=True)
+    if envelope.get("success") is False:
+        raise reconstruct_error(envelope)
+    return {"results": (envelope.get("results") or [[]])[0]}
+
+
 def _request(
     model: Any, method: str, call: Callable[..., Any], **fixed: Any
 ) -> Callable[..., Any]:
@@ -208,6 +232,26 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "loadVectorIndex": _request(
         VectorIndexRequest, "vectorIndex", vector_index, operation="load"
     ),
+    # The vector index is a handle API in JS -- an object with methods on it,
+    # keyed by the id the worker assigned. The wire protocol keys on that id
+    # too, which is what lets the same catalog body run here without a handle
+    # wrapper: every operation is one request naming the index.
+    "vectorIndexAdd": _request(
+        VectorIndexRequest, "vectorIndex", vector_index, operation="add"
+    ),
+    "vectorIndexRemove": _request(
+        VectorIndexRequest, "vectorIndex", vector_index, operation="remove"
+    ),
+    "vectorIndexContains": _request(
+        VectorIndexRequest, "vectorIndex", vector_index, operation="contains"
+    ),
+    "vectorIndexWrite": _request(
+        VectorIndexRequest, "vectorIndex", vector_index, operation="write"
+    ),
+    "vectorIndexDispose": _request(
+        VectorIndexRequest, "vectorIndex", vector_index, operation="dispose"
+    ),
+    "vectorIndexSearch": _vector_index_search,
     "finetune": _request(FinetuneRequest, "finetune", finetune),
     # --- plugins -------------------------------------------------------------
     "invokePlugin": lambda transport, params: invoke_plugin(
@@ -1197,6 +1241,12 @@ class Interpreter:
         join = body.get("join")
         if join is not None and isinstance(value, (list, tuple)):
             value = join.join(str(v) for v in value)
+        if body.get("count"):
+            if not isinstance(value, (list, tuple, bytes, bytearray)):
+                raise StepError(
+                    f'project count: "{body["path"]}" is not a list'
+                )
+            value = len(value)
         scope[body["as"]] = value
         return None
 

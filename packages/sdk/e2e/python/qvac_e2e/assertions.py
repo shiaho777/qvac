@@ -80,6 +80,30 @@ def equals_joined(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(parts)} part(s) joined")
 
 
+def contains_all(value: Any, args: dict[str, Any]) -> StepResult:
+    """The text contains every one of these terms.
+
+    The same shape as a `contains-all` expectation, available as a named
+    assertion so a body can ask it of something other than the one value the
+    expectation is about -- a rejection's message alongside its code, say.
+    """
+    text = str(value or "").lower()
+    terms = args.get("terms") or []
+    missing = [term for term in terms if term.lower() not in text]
+    if missing:
+        return StepResult.fail(f"missing {missing} in: {str(value)[:200]}")
+    return StepResult.ok(f"{len(terms)} term(s) present")
+
+
+def contains_any(value: Any, args: dict[str, Any]) -> StepResult:
+    """The text contains at least one of these terms."""
+    text = str(value or "").lower()
+    terms = args.get("terms") or []
+    if not any(term.lower() in text for term in terms):
+        return StepResult.fail(f"none of {terms} in: {str(value)[:200]}")
+    return StepResult.ok("matched")
+
+
 def any_field_present(value: Any, args: dict[str, Any]) -> StepResult:
     """At least one of the named fields is present.
 
@@ -629,6 +653,8 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "lengthIs": length_is,
     "lengthAtLeast": length_at_least,
     "anyFieldPresent": any_field_present,
+    "containsAll": contains_all,
+    "containsAny": contains_any,
     "equalsJoined": equals_joined,
     "isEmptyText": is_empty_text,
     "numbersInRange": numbers_in_range,

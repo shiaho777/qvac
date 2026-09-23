@@ -125,8 +125,47 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
     await ragDeleteWorkspace(params)
     return { deleted: true }
   },
-  createVectorIndex: (params) => createVectorIndex(params),
-  loadVectorIndex: (params) => loadVectorIndex(params),
+  // The vector index is a handle API: `createVectorIndex` hands back an object
+  // with methods on it, and a step can only name a method and pass data. So
+  // the handle is kept here, keyed by the id the worker gave it, and every
+  // operation takes that id -- which is also what the wire protocol does, and
+  // therefore what a client without a handle wrapper can reproduce.
+  createVectorIndex: async (params) => describeIndex(await createVectorIndex(params)),
+  loadVectorIndex: async (params) => describeIndex(await loadVectorIndex(params)),
+  vectorIndexAdd: async (params: never) => {
+    const p = params as { indexId: string; ids: unknown[]; vectors: number[][] }
+    return await vectorIndex(p.indexId).add({ ids: p.ids as never, vectors: p.vectors })
+  },
+  vectorIndexSearch: async (params: never) => {
+    const p = params as { indexId: string; query: number[]; k: number }
+    return { results: await vectorIndex(p.indexId).search({ query: p.query, k: p.k }) }
+  },
+  vectorIndexRemove: async (params: never) => {
+    const p = params as { indexId: string; ids: unknown[] }
+    const index = vectorIndex(p.indexId)
+    const removed = await index.remove({ ids: p.ids as never })
+    return { removed, length: index.length }
+  },
+  vectorIndexContains: async (params: never) => {
+    const p = params as { indexId: string; ids: unknown[] }
+    return { present: await vectorIndex(p.indexId).contains({ ids: p.ids as never }) }
+  },
+  vectorIndexWrite: async (params: never) => {
+    const p = params as { indexId: string; path: string }
+    return await vectorIndex(p.indexId).write({ path: p.path })
+  },
+  vectorIndexDispose: async (params: never) => {
+    const p = params as { indexId: string }
+    const index = VECTOR_INDEXES.get(p.indexId)
+    if (!index) return { disposed: false }
+    await index.dispose()
+    VECTOR_INDEXES.delete(p.indexId)
+    return { disposed: true }
+  },
+  vectorIndexLength: async (params: never) => {
+    const p = params as { indexId: string }
+    return { length: vectorIndex(p.indexId).length }
+  },
 
   // --- plugins -------------------------------------------------------------
   invokePlugin: async (params) => ({ result: await invokePlugin(params) }),
@@ -455,6 +494,28 @@ const ASSET_ROOTS: Record<string, string> = {
   audio: 'assets/audio',
   document: 'assets/documents',
   neural: 'assets/neural'
+}
+
+/**
+ * Live vector indexes, by the id the worker assigned.
+ *
+ * `createVectorIndex` returns an object with methods; a step can only name a
+ * method and pass data, so the object stays here and the id travels through
+ * the catalog instead. The id is what the wire protocol keys on anyway, which
+ * is what makes the same body runnable by a client that has no handle
+ * wrapper.
+ */
+const VECTOR_INDEXES = new Map<string, Awaited<ReturnType<typeof createVectorIndex>>>()
+
+const describeIndex = (index: Awaited<ReturnType<typeof createVectorIndex>>) => {
+  VECTOR_INDEXES.set(index.indexId, index)
+  return { indexId: index.indexId, dim: index.dim, storage: index.storage, length: index.length }
+}
+
+const vectorIndex = (indexId: string) => {
+  const index = VECTOR_INDEXES.get(indexId)
+  if (!index) throw new Error(`vector index "${indexId}" is not open in this client`)
+  return index
 }
 
 /** How much data a value carries, whether it arrived as bytes or a list. */
@@ -918,6 +979,39 @@ const ASSERTIONS: Record<
       }
     }
     return { passed: true, output: `${parts.length} part(s) joined` }
+  },
+
+  /**
+   * The text contains every one of these terms.
+   *
+   * The same shape as a `contains-all` expectation, available as a named
+   * assertion so a body can ask it of something other than the one value the
+   * expectation is about -- a rejection's message alongside its code, say.
+   */
+  containsAll(value, args) {
+    const text = String(value ?? '').toLowerCase()
+    const terms = (args.terms ?? []) as string[]
+    const missing = terms.filter((term) => !text.includes(term.toLowerCase()))
+    if (missing.length > 0) {
+      return {
+        passed: false,
+        output: `missing ${JSON.stringify(missing)} in: ${String(value).slice(0, 200)}`
+      }
+    }
+    return { passed: true, output: `${terms.length} term(s) present` }
+  },
+
+  /** The text contains at least one of these terms. */
+  containsAny(value, args) {
+    const text = String(value ?? '').toLowerCase()
+    const terms = (args.terms ?? []) as string[]
+    if (!terms.some((term) => text.includes(term.toLowerCase()))) {
+      return {
+        passed: false,
+        output: `none of ${JSON.stringify(terms)} in: ${String(value).slice(0, 200)}`
+      }
+    }
+    return { passed: true, output: 'matched' }
   },
 
   /**

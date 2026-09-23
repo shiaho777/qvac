@@ -422,6 +422,12 @@ export class StepInterpreter {
       if (step.project.join !== undefined && Array.isArray(value)) {
         value = value.map((v) => String(v)).join(step.project.join)
       }
+      if (step.project.count) {
+        if (!Array.isArray(value) && !ArrayBuffer.isView(value)) {
+          throw new StepError(`project count: "${step.project.path}" is not a list`)
+        }
+        value = (value as unknown[]).length
+      }
       scope[step.project.as] = value
       return undefined
     }

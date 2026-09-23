@@ -164,6 +164,14 @@ export const stepSchema: z.ZodType<Step> = z.lazy(() =>
           from: z.string().describe('Reference to project out of, e.g. "$result"'),
           path: z.string().describe('Field path, e.g. "a.b[0].c" or "blocks[*].text"'),
           join: z.string().optional().describe('Join a projected list with this separator'),
+          count: z
+            .boolean()
+            .optional()
+            .describe(
+              'Bind how many elements the projected value has rather than the value itself. ' +
+                'For the sizes a later call needs as an argument -- the width of an embedding ' +
+                'a vector index is about to be opened for, say'
+            ),
           as: z.string()
         })
       })
@@ -240,7 +248,7 @@ export type Step =
     }
   | { settle: { of: string; as?: string } }
   | { repeat: { over: string; as: string; collectInto: string; steps: Step[] } }
-  | { project: { from: string; path: string; join?: string; as: string } }
+  | { project: { from: string; path: string; join?: string; count?: boolean; as: string } }
   | {
       assert: {
         on: string

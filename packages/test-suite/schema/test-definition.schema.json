@@ -478,6 +478,10 @@
             "join": {
               "type": "string"
             },
+            "count": {
+              "type": "boolean",
+              "description": "Bind how many elements the projected value has rather than the value itself. For the sizes a later call needs as an argument."
+            },
             "as": {
               "type": "string"
             }
