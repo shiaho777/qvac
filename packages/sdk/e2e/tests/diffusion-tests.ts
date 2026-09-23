@@ -1,5 +1,5 @@
 // Diffusion test definitions
-import type { TestDefinition, TestResult } from '@qvac/test-suite'
+import type { Step, TestDefinition, TestResult } from '@qvac/test-suite'
 
 type ExpectationLike =
   | { validation: 'type'; expectedType: 'string' | 'number' | 'array' }
@@ -19,6 +19,60 @@ export type DiffusionTestDef<
   TId extends string,
   P extends Record<string, unknown>
 > = TestDefinition & { testId: TId; params: P }
+
+/** Param names that are file names before the run and bytes during it. */
+const DIFFUSION_ASSET_KEYS = new Set(['init_image', 'init_images'])
+
+/**
+ * One diffusion run, checked against its outputs.
+ *
+ * The call parameters ARE the test's params -- the executor passed them
+ * through untouched -- so the body generates the passthrough from whatever the
+ * definition declares rather than listing twenty optional fields that would
+ * drift from the SDK the moment one is added.
+ */
+const diffusionSteps = (
+  dependency: string,
+  params: Record<string, unknown>,
+  fold: 'all' | 'last' | 'events' = 'all'
+): Step[] => {
+  const steps: Step[] = [{ useModel: { deps: [dependency], as: 'model' } }]
+
+  const call: Record<string, unknown> = { modelId: '$model' }
+  for (const key of Object.keys(params)) {
+    if (DIFFUSION_ASSET_KEYS.has(key)) continue
+    call[key] = `$params.${key}`
+  }
+
+  // A single reference image resolves through `asset`, which is what makes the
+  // same definition runnable where a file path is not a thing.
+  if (typeof params.init_image === 'string') {
+    steps.push({
+      asset: { kind: 'image', file: '$params.init_image', form: 'bytes', as: 'initImage' }
+    })
+    call.init_image = '$initImage'
+  }
+
+  steps.push({ call: { method: 'diffusion', collect: fold, params: call, as: 'run' } })
+  steps.push({ project: { from: '$run', path: fold, as: 'outputs' } })
+  steps.push({ assert: { on: '$outputs', use: 'expectation' } })
+  return steps
+}
+
+/**
+ * Bodies that are more than one run: a seed compared against a second run with
+ * the same seed, an img2img output weighed against its txt2img baseline, a
+ * progress stream asserted on, a standalone upscaler.
+ */
+const DIFFUSION_MULTI_RUN = new Set([
+  'diffusion-seed-reproducibility',
+  'diffusion-img2img-vs-txt2img-baseline',
+  'diffusion-streaming',
+  'diffusion-streaming-progress',
+  'diffusion-stats-valid',
+  'diffusion-standalone-upscaler-x4',
+  'diffusion-standalone-upscaler-backend-device'
+])
 
 function createDiffusionTest<const TId extends string, const P extends Record<string, unknown>>(
   testId: TId,
@@ -443,3 +497,16 @@ export const diffusionTests = [
   diffusionStandaloneUpscalerBackendDevice,
   diffusionStandaloneUpscalerCpu
 ] as const
+
+/**
+ * Attach a body to every definition that is one run. Tests that take several
+ * images, or that expect a rejection, keep their hand-written bodies for now:
+ * the first needs a repeat over assets, the second is about the load path.
+ */
+for (const test of diffusionTests) {
+  if (test.steps || DIFFUSION_MULTI_RUN.has(test.testId)) continue
+  if (test.expectation.validation !== 'type') continue
+  const params = test.params as Record<string, unknown>
+  if (Array.isArray(params.init_images)) continue
+  test.steps = diffusionSteps(String(test.metadata?.dependency ?? 'diffusion'), params)
+}

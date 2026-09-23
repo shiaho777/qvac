@@ -1,6 +1,31 @@
-import type { TestDefinition } from '@qvac/test-suite'
+import type { Step, TestDefinition } from '@qvac/test-suite'
 
 // ---- embedding plugin ----
+
+/**
+ * Loading a sharded model IS the test for most of this category: the shards
+ * are assembled on the load path, so a model id coming back means assembly,
+ * hash validation and detection all worked.
+ */
+const loadShardedSteps = (dependency: string): Step[] => [
+  { useModel: { deps: [dependency], as: 'modelId' } },
+  { assert: { on: '$modelId', use: 'expectation' } }
+]
+
+/**
+ * Bodies that do more than load: inference over an assembled model, a batch,
+ * a reload, the backward-compatibility path that loads an unsharded model, and
+ * the missing-shard rejection.
+ */
+const SHARDED_MULTI_STEP = new Set([
+  'sharded-model-backward-compatibility',
+  'sharded-model-batch-inference',
+  'sharded-model-inference',
+  'sharded-model-long-text-inference',
+  'sharded-model-llm-completion',
+  'sharded-model-llm-reload',
+  'sharded-model-llm-missing-shards'
+])
 
 export const shardedModelLoad: TestDefinition = {
   testId: 'sharded-model-load',
@@ -182,3 +207,14 @@ export const shardedModelTests = [
   shardedModelLlmReload,
   shardedModelLlmMissingShards
 ]
+
+/**
+ * Attach the load body to every definition that is only a load. The resource
+ * key is what says which model -- the embedding shards or the LLM ones -- so
+ * the body does not have to.
+ */
+for (const test of shardedModelTests) {
+  if (test.steps || SHARDED_MULTI_STEP.has(test.testId)) continue
+  const dependency = String(test.metadata?.dependency ?? 'sharded-embeddings')
+  test.steps = loadShardedSteps(dependency === 'none' ? 'sharded-embeddings' : dependency)
+}
