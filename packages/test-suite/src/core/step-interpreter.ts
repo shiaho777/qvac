@@ -386,7 +386,12 @@ export class StepInterpreter {
         scope[step.callError.as] = {
           code: e.code === undefined ? '' : String(e.code),
           message: e.message ?? String(error),
-          hasCause: e.cause !== undefined
+          hasCause: e.cause !== undefined,
+          // The typed errors carry data of their own -- the prompt size and
+          // window a context overflow was measured against, say. A test that
+          // could only read the message would be asserting on prose; these are
+          // the numbers it actually wants.
+          details: errorDetails(error)
         }
         return undefined
       }
@@ -535,6 +540,25 @@ export class StepInterpreter {
 }
 
 /** Resolve a dotted path with optional [i] indexes. */
+/**
+ * The data a rejection carries beyond its code and message.
+ *
+ * Own enumerable fields only, and never the plumbing: `stack` is a string
+ * about this client's call frames, and `cause` is already reported as a
+ * boolean. What is left is what the error was built to tell the caller.
+ */
+function errorDetails(error: unknown): Record<string, unknown> {
+  if (typeof error !== 'object' || error === null) return {}
+  const details: Record<string, unknown> = {}
+  for (const key of Object.keys(error as Record<string, unknown>)) {
+    if (key === 'stack' || key === 'message' || key === 'code' || key === 'cause') continue
+    const value = (error as Record<string, unknown>)[key]
+    if (typeof value === 'function') continue
+    details[key] = value
+  }
+  return details
+}
+
 function walk(source: unknown, path: string): unknown {
   let current: unknown = source
   const segments = path.split('.')

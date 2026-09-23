@@ -82,6 +82,106 @@ def equals_joined(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(parts)} part(s) joined")
 
 
+def is_absent(value: Any, _args: dict[str, Any]) -> StepResult:
+    """Nothing is there.
+
+    A completion that ran to its natural end reports no stop reason at all;
+    `null` and `undefined` both mean that, and which one a client uses is a
+    language detail rather than a difference in what happened.
+    """
+    if value is not None:
+        return StepResult.fail(f"expected nothing, got {value!r}")
+    return StepResult.ok("(absent)")
+
+
+def below_budget(value: Any, args: dict[str, Any]) -> StepResult:
+    """The value is a number strictly below the budget.
+
+    The context-boundary test: stopping for "length" only proves the boundary
+    if the run stopped before the prediction budget ran out, so the budget is
+    the bound rather than the thing being measured.
+    """
+    budget = float(args.get("budget", 0))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return StepResult.fail(f"expected a number, got {value!r}")
+    if value >= budget:
+        return StepResult.fail(
+            f"expected fewer than the {budget:g} budgeted (boundary, not "
+            f"prediction cutoff), got {value}"
+        )
+    return StepResult.ok(f"{value} of {budget:g}")
+
+
+def at_least_field(value: Any, args: dict[str, Any]) -> StepResult:
+    """One field of the record is at least as large as another.
+
+    A context overflow reports the prompt it measured and the window it
+    measured against; the guard trips on `>=`, so equality is legitimate and
+    anything below means the parser read the wrong quantity.
+    """
+    record = value if isinstance(value, dict) else {}
+    left_raw = record.get(str(args.get("field")))
+    right_raw = record.get(str(args.get("atLeast")))
+    if not isinstance(left_raw, (int, float)) or not isinstance(
+        right_raw, (int, float)
+    ):
+        return StepResult.fail(
+            f"expected numbers, got {args.get('field')}={left_raw!r} "
+            f"{args.get('atLeast')}={right_raw!r}"
+        )
+    if left_raw < right_raw:
+        return StepResult.fail(
+            f"expected {args.get('field')} >= {args.get('atLeast')}, "
+            f"got {left_raw} < {right_raw}"
+        )
+    return StepResult.ok(f"{left_raw} >= {right_raw}")
+
+
+def json_object_shape(value: Any, args: dict[str, Any]) -> StepResult:
+    """The text is a JSON object, with exactly these fields and types.
+
+    `responseFormat` is a promise about the shape of the output, so the claim
+    is structural: it parses, it is an object rather than an array or a scalar,
+    each named field has the declared type, and -- when `exactKeys` is set --
+    there is nothing else in it, which is what `additionalProperties: false`
+    means.
+    """
+    text = str(value or "")
+    try:
+        parsed = json.loads(text)
+    except ValueError as error:
+        return StepResult.fail(f"not valid JSON: {error}. Output: {text[:200]}")
+    if not isinstance(parsed, dict):
+        kind = "array" if isinstance(parsed, list) else type(parsed).__name__
+        return StepResult.fail(f"expected a JSON object, got {kind}")
+
+    for field, kind in (args.get("fields") or {}).items():
+        measured = parsed.get(field)
+        if kind == "string" and (not isinstance(measured, str) or not measured):
+            return StepResult.fail(
+                f"{field} must be a non-empty string, got {measured!r}"
+            )
+        if kind == "integer" and (
+            not isinstance(measured, int) or isinstance(measured, bool)
+        ):
+            return StepResult.fail(f"{field} must be an integer, got {measured!r}")
+        if kind == "number" and (
+            not isinstance(measured, (int, float)) or isinstance(measured, bool)
+        ):
+            return StepResult.fail(f"{field} must be a number, got {measured!r}")
+
+    exact = args.get("exactKeys")
+    if exact:
+        actual = sorted(parsed)
+        expected = sorted(exact)
+        if actual != expected:
+            return StepResult.fail(
+                "additionalProperties:false violated. Expected exactly "
+                f"[{','.join(expected)}], got [{','.join(actual)}]"
+            )
+    return StepResult.ok(f"object with keys [{','.join(parsed)}]")
+
+
 def png_dimensions(value: Any, args: dict[str, Any]) -> StepResult:
     """The PNG has exactly these dimensions.
 
@@ -858,6 +958,10 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "eventTypeCounts": event_type_counts,
     "transcriptSegmentsShape": transcript_segments_shape,
     "noPartialDownloads": no_partial_downloads,
+    "isAbsent": is_absent,
+    "belowBudget": below_budget,
+    "atLeastField": at_least_field,
+    "jsonObjectShape": json_object_shape,
     "pngDimensions": png_dimensions,
     "nonNegativeNumbers": non_negative_numbers,
     "fieldsSumTo": fields_sum_to,
@@ -904,6 +1008,19 @@ def _as_bytes(value: Any) -> bytes:
     if isinstance(value, list):
         return bytes(bytearray(int(item) & 0xFF for item in value))
     return b""
+
+
+def equal_strings(left: Any, right: Any, _args: dict[str, Any]) -> StepResult:
+    """The two strings are the same.
+
+    `identical_bytes` reads buffers; a seeded completion is compared as text,
+    and reporting "0 bytes differ" about two strings would be nonsense.
+    """
+    if str(left) != str(right):
+        return StepResult.fail(
+            f"differ:\n  {str(left)[:200]!r}\n  {str(right)[:200]!r}"
+        )
+    return StepResult.ok(f"identical, {len(str(left))} char(s)")
 
 
 def identical_bytes(left: Any, right: Any, _args: dict[str, Any]) -> StepResult:
@@ -1017,6 +1134,7 @@ def length_ratio_at_least(left: Any, right: Any, args: dict[str, Any]) -> StepRe
 #: Checks that take two bound values rather than one. Kept beside the
 #: assertions so both clients read one list.
 COMPARISONS: dict[str, Any] = {
+    "equalStrings": equal_strings,
     "identicalBytes": identical_bytes,
     "differentBytes": different_bytes,
     "lengthRatioAtLeast": length_ratio_at_least,

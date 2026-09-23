@@ -342,7 +342,18 @@ const STREAMS: Record<string, Fold> = {
     // question. Splitting them across two folds would mean running the
     // completion twice.
     if (collect === 'text') {
-      return { text: await run.text, toolCalls: (await run.toolCalls) ?? [] }
+      // `stats` and `stopReason` ride along with the text for the same reason
+      // `toolCalls` does: a completion is the expensive part, and "how did it
+      // stop" and "what did it cost" are questions about the run that just
+      // happened, not reasons to run it again.
+      const final = await run.final
+      return {
+        text: await run.text,
+        toolCalls: (await run.toolCalls) ?? [],
+        stats: final.stats,
+        stopReason: final.stopReason,
+        fullText: final.raw?.fullText
+      }
     }
     if (collect === 'events') return { events: await drain(run.events) }
     if (collect === 'all') return { all: await drain(run.tokenStream) }
@@ -803,6 +814,22 @@ const COMPARISONS: Record<
   }
 > = {
   /**
+   * The two strings are the same.
+   *
+   * `identicalBytes` reads buffers; a seeded completion is compared as text,
+   * and reporting "0 bytes differ" about two strings would be nonsense.
+   */
+  equalStrings(left, right) {
+    if (String(left) !== String(right)) {
+      return {
+        passed: false,
+        output: `differ:\n  ${JSON.stringify(String(left).slice(0, 200))}\n  ${JSON.stringify(String(right).slice(0, 200))}`
+      }
+    }
+    return { passed: true, output: `identical, ${String(left).length} char(s)` }
+  },
+
+  /**
    * The two runs produced exactly the same data.
    *
    * The determinism half of a conditioning test: the same inputs twice have to
@@ -938,6 +965,128 @@ const ASSERTIONS: Record<
       return { passed: false, output: `expected ${expected} element(s), got ${value.length}` }
     }
     return { passed: true, output: `${value.length} element(s)` }
+  },
+
+  /**
+   * Nothing is there.
+   *
+   * A completion that ran to its natural end reports no stop reason at all;
+   * `null` and `undefined` both mean that, and which one a client uses is a
+   * language detail rather than a difference in what happened.
+   */
+  isAbsent(value) {
+    if (value !== undefined && value !== null) {
+      return { passed: false, output: `expected nothing, got ${JSON.stringify(value)}` }
+    }
+    return { passed: true, output: '(absent)' }
+  },
+
+  /**
+   * The value is a number strictly below the budget.
+   *
+   * The context-boundary test: stopping for "length" only proves the boundary
+   * if the run stopped before the prediction budget ran out, so the budget is
+   * the bound rather than the thing being measured.
+   */
+  belowBudget(value, args) {
+    const budget = Number(args.budget)
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return { passed: false, output: `expected a number, got ${JSON.stringify(value)}` }
+    }
+    if (value >= budget) {
+      return {
+        passed: false,
+        output: `expected fewer than the ${budget} budgeted (boundary, not prediction cutoff), got ${value}`
+      }
+    }
+    return { passed: true, output: `${value} of ${budget}` }
+  },
+
+  /**
+   * One field of the record is at least as large as another.
+   *
+   * A context overflow reports the prompt it measured and the window it
+   * measured against; the guard trips on `>=`, so equality is legitimate and
+   * anything below means the parser read the wrong quantity.
+   */
+  atLeastField(value, args) {
+    const record = (value ?? {}) as Record<string, unknown>
+    const left = Number(record[String(args.field)])
+    const right = Number(record[String(args.atLeast)])
+    if (!Number.isFinite(left) || !Number.isFinite(right)) {
+      return {
+        passed: false,
+        output: `expected numbers, got ${String(args.field)}=${JSON.stringify(record[String(args.field)])} ${String(args.atLeast)}=${JSON.stringify(record[String(args.atLeast)])}`
+      }
+    }
+    if (left < right) {
+      return {
+        passed: false,
+        output: `expected ${String(args.field)} >= ${String(args.atLeast)}, got ${left} < ${right}`
+      }
+    }
+    return { passed: true, output: `${left} >= ${right}` }
+  },
+
+  /**
+   * The text is a JSON object, with exactly these fields and types.
+   *
+   * `responseFormat` is a promise about the shape of the output, so the claim
+   * is structural: it parses, it is an object rather than an array or a
+   * scalar, each named field has the declared type, and -- when `exactKeys` is
+   * set -- there is nothing else in it, which is what
+   * `additionalProperties: false` means.
+   */
+  jsonObjectShape(value, args) {
+    const text = String(value ?? '')
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return { passed: false, output: `not valid JSON: ${message}. Output: ${text.slice(0, 200)}` }
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return {
+        passed: false,
+        output: `expected a JSON object, got ${Array.isArray(parsed) ? 'array' : typeof parsed}`
+      }
+    }
+    const object = parsed as Record<string, unknown>
+
+    for (const [field, kind] of Object.entries((args.fields ?? {}) as Record<string, string>)) {
+      const measured = object[field]
+      if (kind === 'string' && (typeof measured !== 'string' || measured.length === 0)) {
+        return {
+          passed: false,
+          output: `${field} must be a non-empty string, got ${JSON.stringify(measured)}`
+        }
+      }
+      if (kind === 'integer' && (typeof measured !== 'number' || !Number.isInteger(measured))) {
+        return {
+          passed: false,
+          output: `${field} must be an integer, got ${JSON.stringify(measured)}`
+        }
+      }
+      if (kind === 'number' && typeof measured !== 'number') {
+        return {
+          passed: false,
+          output: `${field} must be a number, got ${JSON.stringify(measured)}`
+        }
+      }
+    }
+
+    if (args.exactKeys) {
+      const actual = Object.keys(object).sort()
+      const expected = [...(args.exactKeys as string[])].sort()
+      if (actual.join(',') !== expected.join(',')) {
+        return {
+          passed: false,
+          output: `additionalProperties:false violated. Expected exactly [${expected.join(',')}], got [${actual.join(',')}]`
+        }
+      }
+    }
+    return { passed: true, output: `object with keys [${Object.keys(object).join(',')}]` }
   },
 
   /**

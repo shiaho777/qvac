@@ -525,13 +525,18 @@ async def _completion_stream(
     if collect == "text":
         # `tool_calls` rides along with the text because a tools test needs
         # both: the model either answered or called a tool, and which one it
-        # did is the question. Two folds would mean two completions.
+        # did is the question. Two folds would mean two completions. `stats`
+        # and `stop_reason` ride along for the same reason.
         calls = await run.tool_calls()
+        final = await run.final
         return {
             "text": await run.text(),
             "toolCalls": [
                 {"name": call.name, "arguments": call.arguments} for call in calls
             ],
+            "stats": _jsonable(final.stats),
+            "stopReason": final.stop_reason,
+            "fullText": final.raw_full_text,
         }
     if collect == "events":
         return {"events": [_jsonable(event) async for event in run.events]}
@@ -1229,6 +1234,11 @@ class Interpreter:
                 "code": "" if code is None else str(code),
                 "message": str(error),
                 "hasCause": error.__cause__ is not None,
+                # The typed errors carry data of their own -- the prompt size
+                # and window a context overflow was measured against, say. A
+                # test that could only read the message would be asserting on
+                # prose; these are the numbers it actually wants.
+                "details": _error_details(error),
             }
             return None
 
@@ -1554,6 +1564,39 @@ class Interpreter:
         if isinstance(value, list):
             return [self._resolve(v, scope) for v in value]
         return value
+
+
+#: Attribute names that differ only in spelling between the clients. The JS
+#: error fields are camelCase; these are the same fields.
+_ERROR_FIELDS = {
+    "prompt_tokens": "promptTokens",
+    "ctx_size": "ctxSize",
+    "cached_tokens": "cachedTokens",
+    "required_tokens": "requiredTokens",
+    "model_id": "modelId",
+    "request_id": "requestId",
+    "partial_text": "partialText",
+    "partial_tool_calls": "partialToolCalls",
+    "partial_stats": "partialStats",
+}
+
+
+def _error_details(error: BaseException) -> dict[str, Any]:
+    """The data a rejection carries beyond its code and message.
+
+    Own attributes only, and never the plumbing: `code` and the cause are
+    already reported separately, and a leading underscore means internal. Names
+    are spelled the way the JS error spells them, so one catalog body reads the
+    same field on both clients.
+    """
+    details: dict[str, Any] = {}
+    for key, value in vars(error).items():
+        if key.startswith("_") or key in ("code", "cause", "message"):
+            continue
+        if callable(value):
+            continue
+        details[_ERROR_FIELDS.get(key, key)] = _jsonable(value)
+    return details
 
 
 def _jsonable(value: Any) -> Any:
