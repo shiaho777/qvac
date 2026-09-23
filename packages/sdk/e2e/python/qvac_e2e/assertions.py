@@ -82,6 +82,72 @@ def equals_joined(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(parts)} part(s) joined")
 
 
+def no_progress_batch_gaps(value: Any, _args: dict[str, Any]) -> StepResult:
+    """Every batch of every phase reported its progress, with no gaps.
+
+    A training run emits one update per batch per phase; the engine tells you
+    how many batches a phase has, so a phase that reported fewer unique batches
+    than it declared dropped some. Counting events alone would not catch it --
+    the total can look healthy while one epoch is missing three batches in the
+    middle.
+    """
+    events = value if isinstance(value, list) else []
+    if not events:
+        return StepResult.fail("no progress events received")
+
+    phases: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        key = ("train" if event.get("is_train") else "val") + (
+            f":epoch{event.get('current_epoch')}"
+        )
+        total = int(event.get("total_batches") or 0)
+        phase = phases.setdefault(key, {"batches": set(), "total": total})
+        phase["batches"].add(event.get("current_batch"))
+        if total > phase["total"]:
+            phase["total"] = total
+
+    drops = []
+    for key, phase in phases.items():
+        if len(phase["batches"]) < phase["total"]:
+            received = sorted(b for b in phase["batches"] if b is not None)
+            drops.append(
+                f"{key}: {len(received)}/{phase['total']} "
+                f"(received=[{','.join(str(b) for b in received)}])"
+            )
+    if drops:
+        return StepResult.fail(f"progress events dropped: {'; '.join(drops)}")
+    return StepResult.ok(
+        f"{len(events)} event(s) across {len(phases)} phase(s), no batch gaps"
+    )
+
+
+def any_element_positive(value: Any, args: dict[str, Any]) -> StepResult:
+    """At least one element reports a finite, positive value for this field.
+
+    Training loss: a run reports one per step, and some of them legitimately
+    arrive as null or zero before the first backward pass. The claim is that
+    the run produced a real number at some point -- a stream of nulls means the
+    loss never reached the caller, however many updates arrived.
+    """
+    items = value if isinstance(value, list) else []
+    field = str(args.get("field"))
+    found = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and isinstance(item.get(field), (int, float))
+        and not isinstance(item.get(field), bool)
+        and item[field] > 0
+    ]
+    if not found:
+        return StepResult.fail(
+            f"no finite positive {field} across {len(items)} element(s)"
+        )
+    return StepResult.ok(f"{len(found)} of {len(items)} had a positive {field}")
+
+
 def at_least(value: Any, args: dict[str, Any]) -> StepResult:
     """The number is at least this large.
 
@@ -972,6 +1038,8 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "eventTypeCounts": event_type_counts,
     "transcriptSegmentsShape": transcript_segments_shape,
     "noPartialDownloads": no_partial_downloads,
+    "anyElementPositive": any_element_positive,
+    "noProgressBatchGaps": no_progress_batch_gaps,
     "atLeast": at_least,
     "isAbsent": is_absent,
     "belowBudget": below_budget,

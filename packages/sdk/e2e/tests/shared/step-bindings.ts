@@ -1,4 +1,5 @@
 import * as fs from 'node:fs'
+import * as os from 'node:os'
 import * as path from 'node:path'
 import {
   audioEdit,
@@ -753,6 +754,12 @@ const vectorIndex = (indexId: string) => {
   return index
 }
 
+/**
+ * Scratch directories this run made, so `producedFile` can only be asked
+ * about one of them and nothing else on the machine.
+ */
+const scratchDirectories = new Set<string>()
+
 /** How much data a value carries, whether it arrived as bytes or a list. */
 const byteLength = (value: unknown): number => {
   if (ArrayBuffer.isView(value)) return (value as Uint8Array).byteLength
@@ -972,6 +979,72 @@ const ASSERTIONS: Record<
       return { passed: false, output: `expected ${expected} element(s), got ${value.length}` }
     }
     return { passed: true, output: `${value.length} element(s)` }
+  },
+
+  /**
+   * Every batch of every phase reported its progress, with no gaps.
+   *
+   * A training run emits one update per batch per phase; the engine tells you
+   * how many batches a phase has, so a phase that reported fewer unique
+   * batches than it declared dropped some. Counting events alone would not
+   * catch it -- the total can look healthy while one epoch is missing three
+   * batches in the middle.
+   */
+  noProgressBatchGaps(value) {
+    const events = (Array.isArray(value) ? value : []) as Array<Record<string, number | boolean>>
+    if (events.length === 0) return { passed: false, output: 'no progress events received' }
+
+    const phases = new Map<string, { batches: Set<number>; total: number }>()
+    for (const event of events) {
+      const key = `${event['is_train'] ? 'train' : 'val'}:epoch${String(event['current_epoch'])}`
+      const total = Number(event['total_batches'])
+      let phase = phases.get(key)
+      if (!phase) {
+        phase = { batches: new Set(), total }
+        phases.set(key, phase)
+      }
+      phase.batches.add(Number(event['current_batch']))
+      if (total > phase.total) phase.total = total
+    }
+
+    const drops: string[] = []
+    for (const [key, phase] of phases) {
+      if (phase.batches.size < phase.total) {
+        const received = [...phase.batches].sort((a, b) => a - b)
+        drops.push(`${key}: ${received.length}/${phase.total} (received=[${received.join(',')}])`)
+      }
+    }
+    if (drops.length > 0) {
+      return { passed: false, output: `progress events dropped: ${drops.join('; ')}` }
+    }
+    return {
+      passed: true,
+      output: `${events.length} event(s) across ${phases.size} phase(s), no batch gaps`
+    }
+  },
+
+  /**
+   * At least one element reports a finite, positive value for this field.
+   *
+   * Training loss: a run reports one per step, and some of them legitimately
+   * arrive as null or zero before the first backward pass. The claim is that
+   * the run produced a real number at some point -- a stream of nulls means
+   * the loss never reached the caller, however many updates arrived.
+   */
+  anyElementPositive(value, args) {
+    const items = (Array.isArray(value) ? value : []) as Array<Record<string, unknown>>
+    const field = String(args.field)
+    const found = items.filter((item) => {
+      const measured = item[field]
+      return typeof measured === 'number' && Number.isFinite(measured) && measured > 0
+    })
+    if (found.length === 0) {
+      return {
+        passed: false,
+        output: `no finite positive ${field} across ${items.length} element(s)`
+      }
+    }
+    return { passed: true, output: `${found.length} of ${items.length} had a positive ${field}` }
   },
 
   /**
@@ -2062,6 +2135,42 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
       if (method === 'evictResource') {
         await resources.evict(String((params as { dep: string }).dep))
         return { evicted: true }
+      }
+      /**
+       * A fresh directory the test may write into, and a look at what landed
+       * there.
+       *
+       * Platform facts, not SDK calls, which is why they live beside
+       * `asset` rather than in the method tables. They are deliberately
+       * narrow: the directory is one this client just made, and the only
+       * question asked of it is whether a file the API was told to produce is
+       * there. That is a claim about the public contract -- unlike reading
+       * the engine's own storage layout, which would let a test assert
+       * anything about anywhere.
+       */
+      if (method === 'scratchDirectory') {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qvac-e2e-'))
+        for (const name of ((params as { subdirectories?: string[] }).subdirectories ??
+          []) as string[]) {
+          fs.mkdirSync(path.join(root, name), { recursive: true })
+        }
+        scratchDirectories.add(root)
+        return { path: root }
+      }
+      if (method === 'producedFile') {
+        const p = params as { directory: string; file: string }
+        if (!scratchDirectories.has(p.directory)) {
+          throw new Error(`"${p.directory}" is not a directory this test created`)
+        }
+        const target = path.join(p.directory, p.file)
+        return { exists: fs.existsSync(target), path: target }
+      }
+      if (method === 'discardScratchDirectory') {
+        const target = (params as { path?: string }).path
+        if (!target || !scratchDirectories.has(target)) return { discarded: false }
+        scratchDirectories.delete(target)
+        fs.rmSync(target, { recursive: true, force: true })
+        return { discarded: true }
       }
       if (collect) {
         const stream = STREAMS[method]

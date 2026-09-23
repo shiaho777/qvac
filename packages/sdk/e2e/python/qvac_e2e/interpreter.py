@@ -16,11 +16,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import math
+import shutil
+import tempfile
 import re
 import sys
 from array import array
 from collections.abc import Callable
 from contextlib import suppress
+from pathlib import Path
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from typing import Any
 
@@ -341,6 +344,60 @@ async def _download_asset(transport: Any, params: dict[str, Any]) -> Any:
     if envelope.get("success") is False:
         raise reconstruct_error(envelope)
     return {"path": envelope.get("assetId")}
+
+
+#: Scratch directories this run made, so `producedFile` can only be asked
+#: about one of them and nothing else on the machine.
+_SCRATCH_DIRECTORIES: set[str] = set()
+
+
+def _within_scratch(candidate: str) -> bool:
+    """Is this path one of this run's scratch roots, or inside one?"""
+    resolved = Path(candidate).resolve()
+    for root in _SCRATCH_DIRECTORIES:
+        root_path = Path(root).resolve()
+        if resolved == root_path or root_path in resolved.parents:
+            return True
+    return False
+
+
+def _within_scratch(candidate: str) -> bool:
+    """Is this path one of this run's scratch roots, or inside one?"""
+    resolved = Path(candidate).resolve()
+    for root in _SCRATCH_DIRECTORIES:
+        root_path = Path(root).resolve()
+        if resolved == root_path or root_path in resolved.parents:
+            return True
+    return False
+
+
+def _scratch(method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """The scratch-directory surface, kept in step with the JS bindings."""
+    if method == "scratchDirectory":
+        root = tempfile.mkdtemp(prefix="qvac-e2e-")
+        directories: dict[str, str] = {}
+        for name in params.get("subdirectories") or []:
+            directories[name] = str(Path(root, name))
+            Path(root, name).mkdir(parents=True, exist_ok=True)
+        _SCRATCH_DIRECTORIES.add(root)
+        # The subdirectory paths are handed back rather than joined in the
+        # catalog: a step names data, and building a path out of two bound
+        # values is not something it can do.
+        return {"path": root, "directories": directories}
+    if method == "producedFile":
+        directory = str(params.get("directory"))
+        if not _within_scratch(directory):
+            raise StepError(
+                f'"{directory}" is not inside a directory this test created'
+            )
+        target = Path(directory, str(params.get("file")))
+        return {"exists": target.exists(), "path": str(target)}
+    target_root = params.get("path")
+    if not target_root or target_root not in _SCRATCH_DIRECTORIES:
+        return {"discarded": False}
+    _SCRATCH_DIRECTORIES.discard(target_root)
+    shutil.rmtree(target_root, ignore_errors=True)
+    return {"discarded": True}
 
 
 async def _transcribe(transport: Any, params: dict[str, Any]) -> Any:
@@ -1533,6 +1590,13 @@ class Interpreter:
             evicted = self._call_params(body.get("params"), scope)
             await self._resources.evict(str(evicted["dep"]))
             return {"evicted": True}
+        # A fresh directory the test may write into, and a look at what landed
+        # there. Platform facts, not SDK calls, which is why they are handled
+        # here rather than in the method tables. Deliberately narrow: the
+        # directory is one this client just made, and the only question asked
+        # of it is whether a file the API was told to produce is there.
+        if method in ("scratchDirectory", "producedFile", "discardScratchDirectory"):
+            return _scratch(method, self._call_params(body.get("params"), scope))
         call = CALLS.get(method)
         collect = body.get("collect")
         # A streaming method lives in STREAMS, not CALLS, so a step that asks
