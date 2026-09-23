@@ -968,6 +968,23 @@ const ASSERTIONS: Record<
   },
 
   /**
+   * The number is at least this large.
+   *
+   * `cacheTokens` on a warm turn: any positive figure means the prefix was
+   * reused, and zero means it was not, whatever else the stats say.
+   */
+  atLeast(value, args) {
+    const minimum = Number(args.value)
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return { passed: false, output: `expected a number, got ${JSON.stringify(value)}` }
+    }
+    if (value < minimum) {
+      return { passed: false, output: `expected at least ${minimum}, got ${value}` }
+    }
+    return { passed: true, output: String(value) }
+  },
+
+  /**
    * Nothing is there.
    *
    * A completion that ran to its natural end reports no stop reason at all;

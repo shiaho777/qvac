@@ -82,6 +82,20 @@ def equals_joined(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(parts)} part(s) joined")
 
 
+def at_least(value: Any, args: dict[str, Any]) -> StepResult:
+    """The number is at least this large.
+
+    `cacheTokens` on a warm turn: any positive figure means the prefix was
+    reused, and zero means it was not, whatever else the stats say.
+    """
+    minimum = float(args.get("value", 0))
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return StepResult.fail(f"expected a number, got {value!r}")
+    if value < minimum:
+        return StepResult.fail(f"expected at least {minimum:g}, got {value}")
+    return StepResult.ok(str(value))
+
+
 def is_absent(value: Any, _args: dict[str, Any]) -> StepResult:
     """Nothing is there.
 
@@ -958,6 +972,7 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "eventTypeCounts": event_type_counts,
     "transcriptSegmentsShape": transcript_segments_shape,
     "noPartialDownloads": no_partial_downloads,
+    "atLeast": at_least,
     "isAbsent": is_absent,
     "belowBudget": below_budget,
     "atLeastField": at_least_field,

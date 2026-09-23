@@ -44,11 +44,56 @@ const kvCompletionSteps = (): Step[] => [
  * cache intact, several completions racing for one cache path. One call is not
  * what they are about, so they keep their hand-written bodies.
  */
+/**
+ * A run of completions that all share one cache key, each with its own message.
+ *
+ * The executor looped and pushed; as a body that is a `repeat`, with the
+ * per-iteration message named. What is being tested is that a cache survives
+ * being used again -- so every response has to be real, and an empty one is
+ * the failure.
+ */
+const sharedCacheTurns = (over: string, content: string, systemPrompt: string): Step[] => [
+  { useModel: { deps: ['llm'], as: 'model' } },
+  {
+    repeat: {
+      over,
+      as: 'turn',
+      collectInto: 'texts',
+      steps: [
+        {
+          call: {
+            method: 'completion',
+            collect: 'text',
+            params: {
+              modelId: '$model',
+              history: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content }
+              ],
+              stream: '$params.stream?',
+              kvCache: '$params.cacheKey?'
+            },
+            as: 'run'
+          }
+        },
+        { project: { from: '$run', path: 'text', as: 'text' } },
+        { assert: { on: '$text', named: 'nonEmptyText' } }
+      ]
+    }
+  }
+]
+
+/**
+ * Bodies that stay on the executor, and why.
+ *
+ * The three `concurrent`/`auto-concurrency` tests measure when each decode
+ * *started and ended*, from the arrival times of individual tokens, and gate
+ * on whether those intervals overlap. The folds keep what a run produced, not
+ * when each piece of it arrived, so a declarative body could only assert that
+ * every completion came back -- which is the part that already passes when the
+ * lock is broken. The rest are multi-turn flows still to be written out.
+ */
 const KV_CACHE_MULTI_RUN = new Set([
-  'kv-cache-delete-and-reuse',
-  'kv-cache-session-switch',
-  'kv-cache-different-system-prompts',
-  'kv-cache-stats-verification',
   'kv-cache-remove-thinking-compaction',
   'kv-cache-tools-sequential-save',
   'kv-cache-cancel-then-new-prompt',
@@ -182,6 +227,12 @@ export const kvCacheLongSingleMessage: TestDefinition = {
   metadata: { category: 'kv-cache', dependency: 'llm', estimatedDurationMs: 25000 }
 }
 
+/**
+ * Three turns over two cache keys, returning to the first.
+ *
+ * Switching away and back is the point: a cache that was clobbered by the
+ * intervening session would show up on the third turn and nowhere else.
+ */
 export const kvCacheSessionSwitch: TestDefinition = {
   testId: 'kv-cache-session-switch',
   params: {
@@ -193,9 +244,51 @@ export const kvCacheSessionSwitch: TestDefinition = {
     stream: false
   },
   expectation: { validation: 'type', expectedType: 'string' },
+  steps: [
+    { useModel: { deps: ['llm'], as: 'model' } },
+    {
+      repeat: {
+        over: '$params.sessions',
+        as: 'session',
+        collectInto: 'texts',
+        steps: [
+          {
+            call: {
+              method: 'completion',
+              collect: 'text',
+              params: {
+                modelId: '$model',
+                history: [
+                  { role: 'system', content: 'You are a helpful math assistant. Be brief.' },
+                  { role: 'user', content: '$session.message' }
+                ],
+                stream: '$params.stream',
+                kvCache: '$session.key'
+              },
+              as: 'run'
+            }
+          },
+          { project: { from: '$run', path: 'text', as: 'text' } },
+          { assert: { on: '$text', named: 'nonEmptyText' } }
+        ]
+      }
+    },
+    { assert: { on: '$texts', named: 'lengthIs', with: { length: 3 } } }
+  ],
+  finally: [
+    { call: { method: 'deleteCache', params: { kvCacheKey: 'session-switch-a' } } },
+    { call: { method: 'deleteCache', params: { kvCacheKey: 'session-switch-b' } } }
+  ],
   metadata: { category: 'kv-cache', dependency: 'llm', estimatedDurationMs: 45000 }
 }
 
+/**
+ * The same cache key, reused under two different system prompts.
+ *
+ * The prefix changes, so the cached prefix has to be invalidated rather than
+ * reused; a client that matched on the key alone would answer the second
+ * prompt with the first one's state.
+ */
 export const kvCacheDifferentSystemPrompts: TestDefinition = {
   testId: 'kv-cache-different-system-prompts',
   params: {
@@ -205,6 +298,38 @@ export const kvCacheDifferentSystemPrompts: TestDefinition = {
     stream: false
   },
   expectation: { validation: 'type', expectedType: 'string' },
+  steps: [
+    { useModel: { deps: ['llm'], as: 'model' } },
+    {
+      repeat: {
+        over: '$params.systemPrompts',
+        as: 'systemPrompt',
+        collectInto: 'texts',
+        steps: [
+          {
+            call: {
+              method: 'completion',
+              collect: 'text',
+              params: {
+                modelId: '$model',
+                history: [
+                  { role: 'system', content: '$systemPrompt' },
+                  { role: 'user', content: '$params.userMessage' }
+                ],
+                stream: '$params.stream',
+                kvCache: '$params.cacheKey'
+              },
+              as: 'run'
+            }
+          },
+          { project: { from: '$run', path: 'text', as: 'text' } },
+          { assert: { on: '$text', named: 'nonEmptyText' } }
+        ]
+      }
+    },
+    { assert: { on: '$texts', named: 'lengthIs', with: { length: 2 } } }
+  ],
+  finally: [{ call: { method: 'deleteCache', params: { kvCacheKey: '$params.cacheKey' } } }],
   metadata: { category: 'kv-cache', dependency: 'llm', estimatedDurationMs: 30000 }
 }
 
@@ -238,6 +363,13 @@ export const kvCacheWithTools: TestDefinition = {
   metadata: { category: 'kv-cache', dependency: 'llm', estimatedDurationMs: 30000 }
 }
 
+/**
+ * A cache deleted mid-flight, then used again under the same name.
+ *
+ * Deleting a live cache and reusing its key is where a stale handle would
+ * surface: the second completion has to rebuild rather than reload something
+ * that is no longer there.
+ */
 export const kvCacheDeleteAndReuse: TestDefinition = {
   testId: 'kv-cache-delete-and-reuse',
   params: {
@@ -246,9 +378,51 @@ export const kvCacheDeleteAndReuse: TestDefinition = {
     stream: false
   },
   expectation: { validation: 'type', expectedType: 'string' },
+  steps: [
+    { useModel: { deps: ['llm'], as: 'model' } },
+    {
+      call: {
+        method: 'completion',
+        collect: 'text',
+        params: {
+          modelId: '$model',
+          history: '$params.history',
+          stream: '$params.stream',
+          kvCache: '$params.cacheKey'
+        },
+        as: 'firstRun'
+      }
+    },
+    { project: { from: '$firstRun', path: 'text', as: 'firstText' } },
+    { assert: { on: '$firstText', named: 'nonEmptyText' } },
+    { call: { method: 'deleteCache', params: { kvCacheKey: '$params.cacheKey' } } },
+    {
+      call: {
+        method: 'completion',
+        collect: 'text',
+        params: {
+          modelId: '$model',
+          history: '$params.history',
+          stream: '$params.stream',
+          kvCache: '$params.cacheKey'
+        },
+        as: 'secondRun'
+      }
+    },
+    { project: { from: '$secondRun', path: 'text', as: 'secondText' } },
+    { assert: { on: '$secondText', named: 'nonEmptyText' } }
+  ],
+  finally: [{ call: { method: 'deleteCache', params: { kvCacheKey: '$params.cacheKey' } } }],
   metadata: { category: 'kv-cache', dependency: 'llm', estimatedDurationMs: 35000 }
 }
 
+/**
+ * Two turns over one cache, and the second one has to say it reused it.
+ *
+ * `cacheTokens` is the evidence. Both turns are written out rather than
+ * looped, because the second turn's history contains the first turn's answer
+ * -- which is the whole reason there is a prefix to reuse.
+ */
 export const kvCacheStatsVerification: TestDefinition = {
   testId: 'kv-cache-stats-verification',
   params: {
@@ -257,6 +431,48 @@ export const kvCacheStatsVerification: TestDefinition = {
     stream: false
   },
   expectation: { validation: 'type', expectedType: 'string' },
+  steps: [
+    { useModel: { deps: ['llm'], as: 'model' } },
+    { call: { method: 'deleteCache', params: { kvCacheKey: '$params.cacheKey' } } },
+    {
+      call: {
+        method: 'completion',
+        collect: 'text',
+        params: {
+          modelId: '$model',
+          history: [
+            { role: 'system', content: 'You are a helpful assistant. Be brief.' },
+            { role: 'user', content: '$params.messages[0]' }
+          ],
+          stream: true,
+          kvCache: '$params.cacheKey'
+        },
+        as: 'firstTurn'
+      }
+    },
+    { project: { from: '$firstTurn', path: 'text', as: 'firstText' } },
+    {
+      call: {
+        method: 'completion',
+        collect: 'text',
+        params: {
+          modelId: '$model',
+          history: [
+            { role: 'system', content: 'You are a helpful assistant. Be brief.' },
+            { role: 'user', content: '$params.messages[0]' },
+            { role: 'assistant', content: '$firstText' },
+            { role: 'user', content: '$params.messages[1]' }
+          ],
+          stream: true,
+          kvCache: '$params.cacheKey'
+        },
+        as: 'secondTurn'
+      }
+    },
+    { project: { from: '$secondTurn', path: 'stats.cacheTokens', as: 'cacheTokens' } },
+    { assert: { on: '$cacheTokens', named: 'atLeast', with: { value: 1 } } }
+  ],
+  finally: [{ call: { method: 'deleteCache', params: { kvCacheKey: '$params.cacheKey' } } }],
   suites: ['smoke'],
   metadata: { category: 'kv-cache', dependency: 'llm', estimatedDurationMs: 90000 }
 }
