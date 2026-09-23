@@ -891,6 +891,26 @@ const COMPARISONS: Record<
   }
 > = {
   /**
+   * The left number is strictly larger than the right.
+   *
+   * Two cache-token readings taken either side of a model reload: the second
+   * can only exceed the first if the cache was written to disk and read back,
+   * because the reload cleared everything held in memory. Equal readings mean
+   * the save was silently dropped.
+   */
+  greaterThan(left, right) {
+    const [a, b] = [Number(left), Number(right)]
+    if (!Number.isFinite(a) || !Number.isFinite(b)) {
+      return {
+        passed: false,
+        output: `expected numbers, got ${JSON.stringify(left)} and ${JSON.stringify(right)}`
+      }
+    }
+    if (a <= b) return { passed: false, output: `expected ${a} > ${b}` }
+    return { passed: true, output: `${a} > ${b}` }
+  },
+
+  /**
    * The two strings are the same.
    *
    * `identicalBytes` reads buffers; a seeded completion is compared as text,

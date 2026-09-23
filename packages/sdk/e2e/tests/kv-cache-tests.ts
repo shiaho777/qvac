@@ -93,9 +93,104 @@ const sharedCacheTurns = (over: string, content: string, systemPrompt: string): 
  * every completion came back -- which is the part that already passes when the
  * lock is broken. The rest are multi-turn flows still to be written out.
  */
+/**
+ * One two-turn conversation over a named cache, with reasoning compaction set
+ * one way or the other, leaving the second turn's cached-token count bound.
+ */
+const thinkingSession = (cacheKey: string, removeThinking: boolean, as: string): Step[] => [
+  { call: { method: 'deleteCache', params: { kvCacheKey: cacheKey } } },
+  {
+    call: {
+      method: 'completion',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        history: [{ role: 'user', content: '$params.messages[0]' }],
+        stream: false,
+        kvCache: cacheKey,
+        generationParams: {
+          reasoning_budget: '$params.generationParams.reasoning_budget',
+          predict: '$params.generationParams.predict',
+          temp: '$params.generationParams.temp',
+          seed: '$params.generationParams.seed',
+          remove_thinking_from_context: removeThinking
+        }
+      },
+      as: `${as}First`
+    }
+  },
+  { project: { from: `$${as}First`, path: 'text', as: `${as}FirstText` } },
+  {
+    call: {
+      method: 'completion',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        history: [
+          { role: 'user', content: '$params.messages[0]' },
+          { role: 'assistant', content: `$${as}FirstText` },
+          { role: 'user', content: '$params.messages[1]' }
+        ],
+        stream: false,
+        kvCache: cacheKey,
+        generationParams: {
+          reasoning_budget: '$params.generationParams.reasoning_budget',
+          predict: '$params.generationParams.predict',
+          temp: '$params.generationParams.temp',
+          seed: '$params.generationParams.seed',
+          remove_thinking_from_context: removeThinking
+        }
+      },
+      as: `${as}Second`
+    }
+  },
+  { project: { from: `$${as}Second`, path: 'stats.cacheTokens', as: `${as}CacheTokens` } }
+]
+
+/**
+ * One tool-calling turn over the named cache, leaving its text, its tool call
+ * and its cached-token count bound.
+ */
+const toolTurn = (history: unknown, as: string): Step[] => [
+  {
+    call: {
+      method: 'completion',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        history,
+        stream: '$params.stream',
+        kvCache: '$params.cacheKey',
+        tools: '$params.tools',
+        generationParams: '$params.generationParams'
+      },
+      as: `${as}Turn`
+    }
+  },
+  { project: { from: `$${as}Turn`, path: 'text', as: `${as}Text` } },
+  { project: { from: `$${as}Turn`, path: 'toolCalls', as: `${as}Calls` } },
+  {
+    assert: {
+      on: `$${as}Calls`,
+      named: 'toolCallShape',
+      with: {
+        declared: ['$params.declaredTool'],
+        name: '$params.declaredTool',
+        argKeys: '$params.requiredArgs'
+      }
+    }
+  },
+  { project: { from: `$${as}Turn`, path: 'stats.cacheTokens', as: `${as}CacheTokens` } }
+]
+
+/**
+ * The two cancellation tests below stay on their executor for the same reason
+ * `finetune-pause-resume` does: they cancel after a given number of tokens has
+ * arrived, which means deciding inside the stream. `start`/`settle` can put a
+ * call in flight, but a step cannot carry the predicate that says when the
+ * moment has come.
+ */
 const KV_CACHE_MULTI_RUN = new Set([
-  'kv-cache-remove-thinking-compaction',
-  'kv-cache-tools-sequential-save',
   'kv-cache-cancel-then-new-prompt',
   'kv-cache-cancel-keeps-committed-cache',
   'kv-cache-concurrent-same-key',
@@ -479,6 +574,18 @@ export const kvCacheStatsVerification: TestDefinition = {
 
 // Reasoning-model dependency ("tools" is the cross-platform Qwen3 build),
 // since the default `llm` resource is Llama and emits no reasoning block.
+/**
+ * Two identical two-turn conversations, one with reasoning compaction on.
+ *
+ * With compaction on, turn one's `<think>` block is dropped from the persisted
+ * cache, so turn two reloads a smaller prefix and reports fewer cached tokens.
+ * A passthrough regression -- the flag dropped before the addon -- collapses
+ * the two runs to equal counts, which is exactly what the comparison catches.
+ *
+ * Both turns of each session are written out rather than looped: turn two's
+ * history contains turn one's answer, which is the whole reason there is a
+ * prefix to reuse.
+ */
 export const kvCacheRemoveThinkingCompaction: TestDefinition = {
   testId: 'kv-cache-remove-thinking-compaction',
   params: {
@@ -494,6 +601,16 @@ export const kvCacheRemoveThinkingCompaction: TestDefinition = {
   },
   expectation: { validation: 'type', expectedType: 'string' },
   suites: ['smoke'],
+  steps: [
+    { useModel: { deps: ['tools'], as: 'model' } },
+    ...thinkingSession('$params.cacheKeyOn', true, 'on'),
+    ...thinkingSession('$params.cacheKeyOff', false, 'off'),
+    { compare: { left: '$offCacheTokens', right: '$onCacheTokens', named: 'greaterThan' } }
+  ],
+  finally: [
+    { call: { method: 'deleteCache', params: { kvCacheKey: '$params.cacheKeyOn' } } },
+    { call: { method: 'deleteCache', params: { kvCacheKey: '$params.cacheKeyOff' } } }
+  ],
   metadata: { category: 'kv-cache', dependency: 'tools', estimatedDurationMs: 180000 }
 }
 
@@ -508,6 +625,16 @@ export const kvCacheNoSystemPrompt: TestDefinition = {
   metadata: { category: 'kv-cache', dependency: 'llm', estimatedDurationMs: 20000 }
 }
 
+/**
+ * Two tool-calling turns with a model reload in between.
+ *
+ * The reload is the test. It clears everything the addon holds in memory, so
+ * the second turn's cached tokens can only have come from the file on disk --
+ * if the save was silently rejected the two counts come back equal. Both turns
+ * must also still produce a well-formed call against a declared tool, because
+ * a cache that reloaded but corrupted the tool grammar would satisfy the
+ * token comparison on its own.
+ */
 export const kvCacheToolsSequentialSave: TestDefinition = {
   testId: 'kv-cache-tools-sequential-save',
   params: {
@@ -530,9 +657,37 @@ export const kvCacheToolsSequentialSave: TestDefinition = {
     ],
     messages: ['What is 10 + 20?', 'Now what is 5 + 5?'],
     stream: true,
-    generationParams: { temp: 0, top_k: 1, seed: 42 }
+    generationParams: { temp: 0, top_k: 1, seed: 42 },
+    declaredTool: 'calculator',
+    requiredArgs: ['operation', 'a', 'b']
   },
   expectation: { validation: 'type', expectedType: 'string' },
+  steps: [
+    { call: { method: 'deleteCache', params: { kvCacheKey: '$params.cacheKey' } } },
+    { useModel: { deps: ['tools'], as: 'model' } },
+    ...toolTurn([{ role: 'user', content: '$params.messages[0]' }], 'first'),
+    // Evict and reload to clear the in-memory cache. Without this the addon
+    // keeps the session in RAM and the second turn would report more cached
+    // tokens even if the disk save never happened.
+    { call: { method: 'evictResource', params: { dep: 'tools' } } },
+    { useModel: { deps: ['tools'], as: 'model' } },
+    ...toolTurn(
+      [
+        { role: 'user', content: '$params.messages[0]' },
+        { role: 'assistant', content: '$firstText' },
+        { role: 'user', content: '$params.messages[1]' }
+      ],
+      'second'
+    ),
+    {
+      compare: {
+        left: '$secondCacheTokens',
+        right: '$firstCacheTokens',
+        named: 'greaterThan'
+      }
+    }
+  ],
+  finally: [{ call: { method: 'deleteCache', params: { kvCacheKey: '$params.cacheKey' } } }],
   metadata: { category: 'kv-cache', dependency: 'tools', estimatedDurationMs: 90000 }
 }
 

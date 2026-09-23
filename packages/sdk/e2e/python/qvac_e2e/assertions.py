@@ -1168,6 +1168,21 @@ def _as_bytes(value: Any) -> bytes:
     return b""
 
 
+def greater_than(left: Any, right: Any, _args: dict[str, Any]) -> StepResult:
+    """The left number is strictly larger than the right.
+
+    Two cache-token readings taken either side of a model reload: the second
+    can only exceed the first if the cache was written to disk and read back,
+    because the reload cleared everything held in memory. Equal readings mean
+    the save was silently dropped.
+    """
+    if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+        return StepResult.fail(f"expected numbers, got {left!r} and {right!r}")
+    if left <= right:
+        return StepResult.fail(f"expected {left} > {right}")
+    return StepResult.ok(f"{left} > {right}")
+
+
 def equal_strings(left: Any, right: Any, _args: dict[str, Any]) -> StepResult:
     """The two strings are the same.
 
@@ -1293,6 +1308,7 @@ def length_ratio_at_least(left: Any, right: Any, args: dict[str, Any]) -> StepRe
 #: assertions so both clients read one list.
 COMPARISONS: dict[str, Any] = {
     "equalStrings": equal_strings,
+    "greaterThan": greater_than,
     "identicalBytes": identical_bytes,
     "differentBytes": different_bytes,
     "lengthRatioAtLeast": length_ratio_at_least,
