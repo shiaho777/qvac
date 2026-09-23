@@ -226,7 +226,19 @@ export const finetuneErrorCases = createFinetuneTest(
         as: 'missingDataset'
       }
     },
-    { assert: { on: '$missingDataset', named: 'errorIsStructured' } }
+    // The message, not the structure. The unknown-model refusal above carries
+    // a code; this one carries neither a code nor a cause -- it surfaces as a
+    // bare "Unable to open dataset file". Worth fixing in the SDK, but
+    // asserting structure here would be failing the test for something the
+    // executor never claimed.
+    { project: { from: '$missingDataset', path: 'message', as: 'datasetMessage' } },
+    {
+      assert: {
+        on: '$datasetMessage',
+        named: 'containsAll',
+        with: { terms: ['missing-train.jsonl'] }
+      }
+    }
   ]
 )
 
