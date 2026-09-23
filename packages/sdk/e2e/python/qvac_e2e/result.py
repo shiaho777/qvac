@@ -71,17 +71,23 @@ class StepResult:
         return message
 
 
-def _summarise(value: Any, limit: int = 64) -> Any:
+def _summarise(value: Any, depth: int = 0, limit: int = 64) -> Any:
     """Keep the report small while still comparable across clients.
 
     A full embedding vector is thousands of floats; what a cross-client diff
     needs is the shape and a stable sample, not the whole payload.
+
+    `depth` stops at the same place the JS summariser stops. Without it the two
+    clients describe a deeply nested value differently -- one expanded, one
+    elided -- and the comparison reports drift in its own reporting.
     """
+    if depth > 3:
+        return "…"
     if isinstance(value, (list, tuple)):
         return {
             "kind": "array",
             "length": len(value),
-            "head": [_summarise(v, limit) for v in value[:8]],
+            "head": [_summarise(v, depth + 1, limit) for v in value[:8]],
         }
     if isinstance(value, (bytes, bytearray, memoryview)):
         # Without this a PCM buffer or an image falls through to str(), which
@@ -93,7 +99,7 @@ def _summarise(value: Any, limit: int = 64) -> Any:
     if isinstance(value, str):
         return value if len(value) <= limit * 8 else value[: limit * 8] + "…"
     if isinstance(value, dict):
-        return {k: _summarise(v, limit) for k, v in list(value.items())[:16]}
+        return {k: _summarise(v, depth + 1, limit) for k, v in list(value.items())[:16]}
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     # Anything else (an enum, a date, a model object) would take the bridge

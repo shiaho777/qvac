@@ -46,7 +46,10 @@ def fields_present(value: Any, args: dict[str, Any]) -> StepResult:
     if not isinstance(value, dict):
         return StepResult.fail(f"expected an object, got {type(value).__name__}")
     fields: list[str] = args.get("fields") or []
-    missing = [field for field in fields if value.get(field) is None]
+    # Key absence, not falsiness: JS checks `=== undefined`, so a field the SDK
+    # reports as an explicit null counts as present there. Checking `is None`
+    # here would fail the same record on Python and call it drift.
+    missing = [field for field in fields if field not in value]
     if missing:
         return StepResult.fail(f"missing fields: {', '.join(missing)}")
     return StepResult.ok(f"{len(fields)} field(s) present")

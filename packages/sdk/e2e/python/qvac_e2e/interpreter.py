@@ -50,6 +50,7 @@ from tetherto.qvac_sdk import (
     model_registry_get_model,
     model_registry_list,
     model_registry_search,
+    reconstruct_error,
     rag,
     resume,
     state,
@@ -81,10 +82,33 @@ from .validation import validate
 # Deliberately explicit rather than reflective: a typo in a step should be an
 # `incomplete` with a clear reason, not an attribute error deep in a stream.
 def _request(model: Any, method: str, call: Callable[..., Any]) -> Callable[..., Any]:
-    """Wrap a generated stub that takes a validated request model."""
+    """Wrap a generated stub that takes a validated request model.
 
-    def invoke(transport: Any, params: dict[str, Any]) -> Any:
-        return call(transport, model.model_validate({"type": method, **params}))
+    A generated stub hands back the wire envelope as it arrived, so a rejected
+    call shows up as `success: false` rather than as an exception. Turning that
+    into a raise is the binding's job, not the interpreter's: the JS client
+    gets the same treatment from its SDK before the interpreter ever sees a
+    value, and the interpreter has to mean the same thing on both clients or
+    the comparison is worthless. The ergonomic wrappers raise already and do
+    not go through here.
+    """
+
+    async def invoke(transport: Any, params: dict[str, Any]) -> Any:
+        response = await call(
+            transport, model.model_validate({"type": method, **params})
+        )
+        envelope = (
+            response.model_dump() if hasattr(response, "model_dump") else response
+        )
+        if isinstance(envelope, dict) and envelope.get("success") is False:
+            # reconstruct_error, not a bare StepError: it rebuilds the typed
+            # error the server threw, carrying the same numeric code the JS
+            # client's SDK raises for the same refusal. A codeless exception
+            # here would make `errorIsStructured` and `errorMatches` fail on
+            # Python for a rejection that passes on JS -- drift manufactured by
+            # the binding that exists to prevent it.
+            raise reconstruct_error(envelope)
+        return response
 
     return invoke
 
@@ -485,6 +509,12 @@ class Interpreter:
         try:
             await self._invoke(method, call, params, collect)
         except StepError:
+            # Every StepError reaching here is a binding GAP -- an unwired
+            # method, a fold this client has no run handle for. "This client
+            # cannot do that yet" is not the rejection the test is waiting for,
+            # and binding it as one would report a passing error test for
+            # something the client never ran. A real refusal arrives as the
+            # SDK's own typed error and is handled below, exactly as on JS.
             raise
         except Exception as error:  # noqa: BLE001 - the rejection is the subject
             code = getattr(error, "code", None)
@@ -577,7 +607,16 @@ class Interpreter:
                 f'asset kind "{kind}" is not known to the Python client',
                 incomplete=True,
             )
-        absolute = ASSET_ROOT / root / str(self._resolve(body["file"], scope))
+        base = (ASSET_ROOT / root).resolve()
+        absolute = (base / str(self._resolve(body["file"], scope))).resolve()
+        # The asset name arrives from the catalog, and with form="path" it is
+        # handed straight to the SDK. A definition is data that travels, so a
+        # name that climbs out of the asset root is refused here rather than
+        # trusted because today's catalog happens to contain only literals.
+        if base != absolute and base not in absolute.parents:
+            raise StepError(
+                f'asset "{body["file"]}" resolves outside the "{kind}" asset root'
+            )
         if not absolute.exists():
             # A missing fixture is a real failure, not a client gap.
             raise StepError(f"asset not found: {absolute}")
@@ -634,8 +673,6 @@ class Interpreter:
         response = await self._invoke(method, call, params, collect)
 
         result = _jsonable(response)
-        if isinstance(result, dict) and result.get("success") is False:
-            raise StepError(f"{method} failed: {result.get('error')}")
 
         name = body.get("as")
         scope[name or "result"] = result
