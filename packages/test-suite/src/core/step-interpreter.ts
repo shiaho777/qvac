@@ -91,6 +91,16 @@ class StepError extends Error {
 const INDEXED = /^(.*?)\[(\d+)\]$/
 
 /**
+ * `field[*]` -- the rest of the path applied to every element.
+ *
+ * The path syntax advertised this all along (`blocks[*].text`) while the
+ * walker only understood a fixed index, so a body that used it failed with
+ * `has no "blocks[*]"`. Pulling one field out of a list is the commonest thing
+ * a fold leaves to do.
+ */
+const WILDCARD = /^(.*?)\[\*\]$/
+
+/**
  * A call `start` began and `settle` has yet to await.
  *
  * Held under a symbol so a started call cannot be mistaken for data: every
@@ -517,7 +527,27 @@ export class StepInterpreter {
 /** Resolve a dotted path with optional [i] indexes. */
 function walk(source: unknown, path: string): unknown {
   let current: unknown = source
-  for (const rawSegment of path.split('.')) {
+  const segments = path.split('.')
+  for (const [position, rawSegment] of segments.entries()) {
+    const wildcard = WILDCARD.exec(rawSegment)
+    if (wildcard) {
+      if (wildcard[1]) {
+        if (current === null || current === undefined) {
+          throw new StepError(`path "${path}" walked off a null at "${wildcard[1]}"`)
+        }
+        const container = current as Record<string, unknown>
+        if (!(wildcard[1] in container)) {
+          throw new StepError(`path "${path}" has no "${wildcard[1]}"`)
+        }
+        current = container[wildcard[1]]
+      }
+      if (!Array.isArray(current)) {
+        throw new StepError(`path "${path}" used [*] on a ${typeof current}`)
+      }
+      const rest = segments.slice(position + 1).join('.')
+      return rest ? current.map((item) => walk(item, rest)) : current
+    }
+
     const match = INDEXED.exec(rawSegment)
     const segment = match ? match[1] : rawSegment
     const index = match ? Number(match[2]) : undefined

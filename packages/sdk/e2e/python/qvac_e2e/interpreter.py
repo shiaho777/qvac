@@ -200,12 +200,8 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "state": _request(StateRequest, "state", state),
     # --- rag, vector index, finetune -----------------------------------------
     "ragIngest": _request(RagRequest, "rag", rag, operation="ingest"),
-    "ragCloseWorkspace": _request(
-        RagRequest, "rag", rag, operation="closeWorkspace"
-    ),
-    "ragDeleteWorkspace": _request(
-        RagRequest, "rag", rag, operation="deleteWorkspace"
-    ),
+    "ragCloseWorkspace": _request(RagRequest, "rag", rag, operation="closeWorkspace"),
+    "ragDeleteWorkspace": _request(RagRequest, "rag", rag, operation="deleteWorkspace"),
     "createVectorIndex": _request(
         VectorIndexRequest, "vectorIndex", vector_index, operation="create"
     ),
@@ -441,9 +437,10 @@ async def _audio_stream(run: Any, collect: str, method: str) -> Any:
         # Progress is drained alongside the audio rather than in a second fold:
         # these tests ask whether one run produced audio *and* reported
         # progress, and a second `collect` would be a second generation.
-        progress = asyncio.ensure_future(_drain(run.progress_stream))
-        audio = await run.audio
-        stats = _jsonable(await run.stats)
+        audio, raw_stats, progress = await asyncio.gather(
+            run.audio, run.stats, _drain(run.progress_stream)
+        )
+        stats = _jsonable(raw_stats)
         # `data` here, `pcm` in JS. Renamed so `$run.audio.pcm` is one thing in
         # both clients rather than two spellings of the same bytes.
         return {
@@ -454,7 +451,7 @@ async def _audio_stream(run: Any, collect: str, method: str) -> Any:
                 "bitsPerSample": audio["bitsPerSample"],
             },
             "stats": stats,
-            "events": await progress,
+            "events": progress,
         }
     if collect == "events":
         events = [tick async for tick in run.progress_stream]
@@ -517,7 +514,14 @@ async def _batch_completion_stream(
         **{k: v for k, v in params.items() if k not in ("modelId", "prompts")},
     )
     if collect == "all":
-        return {"all": _jsonable(await run.results)}
+        # Events are drained alongside the results: a streaming batch test asks
+        # whether every prompt produced deltas *and* whether its final agrees
+        # with them, and a second fold would be a second batch.
+        # One `gather`, not two awaits in a row: an empty batch rejects both,
+        # and a rejection awaited second is left unretrieved when the first one
+        # raises. Mirrors the JS fold.
+        results, events = await asyncio.gather(run.results, _drain(run.events))
+        return {"all": _jsonable(results), "events": _jsonable(events)}
     if collect == "events":
         return {"events": _jsonable([event async for event in run.events])}
     raise StepError(
@@ -624,6 +628,11 @@ NOT_YET_ERGONOMIC: dict[str, str] = {
 
 _INDEX = re.compile(r"^(.*?)\[(\d+)\]$")
 
+#: `field[*]` -- the rest of the path applied to every element. The path syntax
+#: advertised this all along (`blocks[*].text`) while neither walker understood
+#: it, so a body that used it failed with `has no "blocks[*]"`.
+_WILDCARD = re.compile(r"^(.*?)\[\*\]$")
+
 
 class _Missing:
     """An optional reference that resolved to nothing.
@@ -655,6 +664,21 @@ _TONE = re.compile(r"^(\d+(?:\.\d+)?)s-(\d+(?:\.\d+)?)hz$")
 #: The input format AudioGen accepts: interleaved stereo 48 kHz Float32 LE PCM.
 _TONE_SAMPLE_RATE = 48000
 _TONE_CHANNELS = 2
+
+
+def _synthesize_bytes(spec: str) -> bytes:
+    """A fixture spelled out in hex: "00010203" is four bytes.
+
+    For the deliberately malformed inputs -- four bytes that cannot be a JPEG,
+    a truncated header. Checking such a file in would hide what makes it
+    invalid behind a binary; written in the catalog, the test says it.
+    """
+    try:
+        return bytes.fromhex(spec)
+    except ValueError as error:
+        raise StepError(
+            f'bytes "{spec}" is not an even-length hex string'
+        ) from error
 
 
 def _synthesize_tone(spec: str) -> bytes:
@@ -962,6 +986,13 @@ class Interpreter:
         # tests differ only in which fixture they use should carry one body and
         # name the file in its params.
         kind = str(self._resolve(body["kind"], scope))
+        if kind == "bytes":
+            if body.get("form") == "path":
+                raise StepError("synthesized bytes have no path")
+            scope[body["as"]] = _synthesize_bytes(
+                str(self._resolve(body["file"], scope))
+            )
+            return None
         if kind == "tone":
             if body.get("form") == "path":
                 raise StepError("a synthesized tone has no path")
@@ -1234,28 +1265,47 @@ def _last_binding(steps: list[dict[str, Any]]) -> str | None:
 def _walk(source: Any, path: str) -> Any:
     """Resolve a dotted path with optional [i] indexes."""
     current = source
-    for segment in path.split("."):
+    segments = path.split(".")
+    for position, raw_segment in enumerate(segments):
+        wildcard = _WILDCARD.match(raw_segment)
+        if wildcard:
+            name = wildcard.group(1)
+            if name:
+                current = _step_into(current, name, path)
+            if not isinstance(current, list):
+                raise StepError(f'path "{path}" used [*] on a {type(current).__name__}')
+            rest = ".".join(segments[position + 1 :])
+            if not rest:
+                return current
+            return [_walk(item, rest) for item in current]
+
+        segment = raw_segment
         match = _INDEX.match(segment)
         index: int | None = None
         if match:
             segment, index = match.group(1), int(match.group(2))
         if segment:
-            # JS's walk() guards this and raises its own error, which the
-            # optional-reference handler then swallows. Without the same guard
-            # here a null intermediate raises AttributeError, which that
-            # handler does not catch -- so `$a.b?` resolves to nothing on JS
-            # and fails the whole test on Python.
-            if current is None:
-                raise StepError(f'path "{path}" walked off a null at "{segment}"')
-            if isinstance(current, dict):
-                if segment not in current:
-                    raise StepError(f'path "{path}" has no "{segment}"')
-                current = current[segment]
-            else:
-                try:
-                    current = getattr(current, segment)
-                except AttributeError as error:
-                    raise StepError(f'path "{path}" has no "{segment}"') from error
+            current = _step_into(current, segment, path)
         if index is not None:
             current = current[index]
     return current
+
+
+def _step_into(current: Any, segment: str, path: str) -> Any:
+    """One named hop along a path.
+
+    JS's walk() guards a null intermediate and raises its own error, which the
+    optional-reference handler then swallows. Without the same guard here a
+    null raises AttributeError, which that handler does not catch -- so
+    `$a.b?` would resolve to nothing on JS and fail the whole test on Python.
+    """
+    if current is None:
+        raise StepError(f'path "{path}" walked off a null at "{segment}"')
+    if isinstance(current, dict):
+        if segment not in current:
+            raise StepError(f'path "{path}" has no "{segment}"')
+        return current[segment]
+    try:
+        return getattr(current, segment)
+    except AttributeError as error:
+        raise StepError(f'path "{path}" has no "{segment}"') from error

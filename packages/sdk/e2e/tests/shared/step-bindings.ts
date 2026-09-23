@@ -280,7 +280,18 @@ const STREAMS: Record<string, Fold> = {
 
   batchCompletion: async (params, collect) => {
     const run = batchCompletion(params)
-    if (collect === 'all') return { all: await run.results }
+    if (collect === 'all') {
+      // Events are drained alongside the results: a streaming batch test asks
+      // whether every prompt produced deltas *and* whether its final agrees
+      // with them, and a second fold would be a second batch.
+      //
+      // Both are awaited through one `Promise.all` rather than in sequence.
+      // An empty batch rejects both, and awaiting them one after the other
+      // leaves the second rejection with nobody listening -- which takes the
+      // whole consumer process down on a test that had already passed.
+      const [all, events] = await Promise.all([run.results, drain(run.events)])
+      return { all, events }
+    }
     if (collect === 'events') return { events: await drain(run.events) }
     throw unsupported('batchCompletion', collect)
   },
@@ -337,13 +348,18 @@ async function audioRun(
     // these tests ask whether one run produced audio *and* reported progress,
     // and a second `collect` would be a second generation -- minutes of work
     // answering a question about the first one.
-    const events = drain(run.progressStream)
-    const audio = (await run.audio) as {
-      pcm: unknown
-      sampleRate: unknown
-      channels: unknown
-      bitsPerSample: unknown
-    }
+    // One `Promise.all`, not three awaits in a row: a run that rejects rejects
+    // all of them, and a rejection awaited second has nobody listening when
+    // the first one throws -- an unhandled rejection that ends the consumer.
+    const [audio, stats, events] = (await Promise.all([
+      run.audio,
+      run.stats,
+      drain(run.progressStream)
+    ])) as [
+      { pcm: unknown; sampleRate: unknown; channels: unknown; bitsPerSample: unknown },
+      unknown,
+      unknown[]
+    ]
     // Spelled out rather than passed through: Python's run hands back the same
     // four values under `data`, so naming them here is what makes
     // `$run.audio.pcm` one thing in both clients.
@@ -354,8 +370,8 @@ async function audioRun(
         channels: audio.channels,
         bitsPerSample: audio.bitsPerSample
       },
-      stats: await run.stats,
-      events: await events
+      stats,
+      events
     }
   }
   if (collect === 'events') {
@@ -408,6 +424,22 @@ const synthesizeTone = (spec: string): Uint8Array => {
     }
   }
   return new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength)
+}
+
+/**
+ * A fixture spelled out in hex: `"00010203"` is four bytes.
+ *
+ * For the deliberately malformed inputs -- four bytes that cannot be a JPEG,
+ * a truncated header. Checking such a file in would hide what makes it invalid
+ * behind a binary; written in the catalog, the test says it.
+ */
+const synthesizeBytes = (spec: string): Uint8Array => {
+  if (spec.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(spec)) {
+    throw new Error(`bytes "${spec}" is not an even-length hex string`)
+  }
+  const out = new Uint8Array(spec.length / 2)
+  for (let i = 0; i < out.length; i++) out[i] = Number.parseInt(spec.slice(i * 2, i * 2 + 2), 16)
+  return out
 }
 
 const ASSET_ROOTS: Record<string, string> = {
@@ -467,6 +499,254 @@ const ASSERTIONS: Record<
       return { passed: false, output: `expected at least ${minimum}, got ${value.length}` }
     }
     return { passed: true, output: `${value.length} element(s)` }
+  },
+
+  /**
+   * Every element's named field sits inside the range.
+   *
+   * A probability is in [0,1] and a utilisation is in [0,1]; naming the bound
+   * in the test rather than the registry keeps one check answering both.
+   */
+  numbersInRange(value, args) {
+    const items = (Array.isArray(value) ? value : []) as Array<Record<string, unknown>>
+    const field = String(args.field)
+    const min = Number(args.min)
+    const max = Number(args.max)
+    for (const item of items) {
+      const measured = item[field]
+      if (typeof measured !== 'number' || measured < min || measured > max) {
+        return {
+          passed: false,
+          output: `${field} is outside [${min}, ${max}]: ${JSON.stringify(measured)}`
+        }
+      }
+    }
+    return { passed: true, output: `${items.length} value(s) within [${min}, ${max}]` }
+  },
+
+  /** The list is ordered by the named field, largest first. */
+  sortedDescendingBy(value, args) {
+    const items = (Array.isArray(value) ? value : []) as Array<Record<string, unknown>>
+    const field = String(args.field)
+    for (let i = 1; i < items.length; i++) {
+      const previous = Number(items[i - 1]?.[field] ?? 0)
+      const current = Number(items[i]?.[field] ?? 0)
+      if (current > previous) {
+        return { passed: false, output: `not sorted by ${field} at index ${i}` }
+      }
+    }
+    return { passed: true, output: `${items.length} element(s) in order` }
+  },
+
+  /**
+   * The named field sums to a value, within a tolerance.
+   *
+   * Softmax probabilities sum to one; the tolerance is what keeps that a claim
+   * about the model rather than about float accumulation order.
+   */
+  sumsTo(value, args) {
+    const items = (Array.isArray(value) ? value : []) as Array<Record<string, unknown>>
+    const field = String(args.field)
+    const total = items.reduce((sum, item) => sum + Number(item[field] ?? 0), 0)
+    const expected = Number(args.total)
+    const tolerance = Number(args.tolerance ?? 1e-3)
+    if (Math.abs(total - expected) > tolerance) {
+      return {
+        passed: false,
+        output: `${field} sums to ${total}, not within ${tolerance} of ${expected}`
+      }
+    }
+    return { passed: true, output: `${field} sums to ${total}` }
+  },
+
+  /**
+   * A `getSystemResources` record is well formed.
+   *
+   * Three claims the executor made inline, kept together because they are one
+   * question about one record: every metric that reports `supported` says
+   * where the number came from and none that does not report a value anyway;
+   * a GPU is identified by an opaque id and never by the raw vendor/device
+   * identifiers, which is a privacy boundary rather than a shape detail; and
+   * a requested sample correlates with the capabilities it was taken against.
+   *
+   * `sample` says whether one was asked for -- a sample that arrives
+   * unrequested is as much a failure as one that is missing.
+   */
+  systemResourcesShape(value, args) {
+    const problems: string[] = []
+    const record = (value ?? {}) as {
+      capabilities?: Record<string, never>
+      sample?: Record<string, never>
+    }
+
+    type Metric = { status?: string; value?: unknown; provenance?: { source?: string } }
+    const metric = (m: unknown, label: string): Metric => {
+      const measured = (m ?? {}) as Metric
+      if (measured.status === 'supported') {
+        if (!measured.provenance?.source) problems.push(`${label} has no provenance source`)
+      } else if ('value' in measured) {
+        problems.push(`${label} exposes a value with status ${String(measured.status)}`)
+      }
+      return measured
+    }
+    const utilization = (m: unknown, label: string) => {
+      const measured = metric(m, label)
+      const reading = measured.value as number
+      if (measured.status === 'supported' && (reading < 0 || reading > 1)) {
+        problems.push(`${label} is outside 0..1: ${reading}`)
+      }
+    }
+
+    const capabilities = (record.capabilities ?? {}) as Record<string, never>
+    if (!record.capabilities) problems.push('capabilities are missing')
+    metric(capabilities['cpu'], 'capabilities.cpu')
+    metric((capabilities['memory'] ?? {})['totalBytes'], 'capabilities.memory.totalBytes')
+    const capabilityGpus = metric(capabilities['gpus'], 'capabilities.gpus')
+
+    const RAW_IDENTITY = ['vendorId', 'deviceId', 'subsystemId', 'revision']
+    let capabilityIds: string[] | undefined
+    if (capabilityGpus.status === 'supported') {
+      const gpus = (capabilityGpus.value ?? []) as Array<Record<string, unknown>>
+      capabilityIds = gpus.map((gpu) => String(gpu['id']))
+      for (const gpu of gpus) {
+        if (!gpu['id']) problems.push('GPU has no opaque ID')
+        for (const field of RAW_IDENTITY) {
+          if (field in gpu) problems.push(`GPU exposes private identity field ${field}`)
+        }
+      }
+    }
+
+    if (!args.sample) {
+      if (record.sample) problems.push('sample returned when it was not requested')
+      return problems.length > 0
+        ? { passed: false, output: problems.join('; ') }
+        : { passed: true, output: 'capabilities valid; sample omitted' }
+    }
+
+    const sample = (record.sample ?? {}) as Record<string, never>
+    if (!record.sample) {
+      problems.push('requested sample is missing')
+      return { passed: false, output: problems.join('; ') }
+    }
+    utilization(sample['cpu'], 'sample.cpu')
+    const memory = (sample['memory'] ?? {}) as Record<string, never>
+    metric(memory['usedBytes'], 'sample.memory.usedBytes')
+    metric(memory['totalBytes'], 'sample.memory.totalBytes')
+    metric(memory['processUsedBytes'], 'sample.memory.processUsedBytes')
+    const allowance = metric(memory['processAvailableBytes'], 'sample.memory.processAvailableBytes')
+    if (allowance.status === 'supported') {
+      const reading = allowance.value as number
+      if (reading <= 0) {
+        problems.push(`sample.memory.processAvailableBytes is not positive: ${reading}`)
+      }
+      const scope = (allowance.provenance as { scope?: string } | undefined)?.scope
+      if (scope !== 'process') {
+        problems.push(`sample.memory.processAvailableBytes carries scope ${String(scope)}`)
+      }
+    } else if (args.platform === 'ios') {
+      problems.push(`sample.memory.processAvailableBytes is ${String(allowance.status)} on iOS`)
+    }
+
+    const sampleGpus = metric(sample['gpus'], 'sample.gpus')
+    if (capabilityIds && sampleGpus.status === 'supported') {
+      const gpus = (sampleGpus.value ?? []) as Array<Record<string, unknown>>
+      if (capabilityIds.join(',') !== gpus.map((gpu) => String(gpu['id'])).join(',')) {
+        problems.push('capability and sample GPU IDs do not correlate')
+      }
+      for (const gpu of gpus) {
+        utilization(gpu['compute'], `sample.gpus.${String(gpu['id'])}.compute`)
+        utilization(gpu['encode'], `sample.gpus.${String(gpu['id'])}.encode`)
+        utilization(gpu['decode'], `sample.gpus.${String(gpu['id'])}.decode`)
+      }
+    }
+
+    return problems.length > 0
+      ? { passed: false, output: problems.join('; ') }
+      : { passed: true, output: 'capabilities valid; sample valid' }
+  },
+
+  /**
+   * Each named result's text carries what that result was asked for.
+   *
+   * A batch answers several prompts at once, so "the output contains both
+   * markers" is not the question -- either prompt could have produced both.
+   * `mode: 'any'` is the looser form a vision prompt needs, where several
+   * words would each be a right answer.
+   */
+  textsById(value, args) {
+    const results = (Array.isArray(value) ? value : []) as Array<{
+      id?: string
+      final?: { contentText?: string }
+    }>
+    const byId = new Map(results.map((result) => [result.id, result.final?.contentText ?? '']))
+    const expected = (args.expect ?? {}) as Record<string, string[]>
+    const any = args.mode === 'any'
+
+    for (const [id, terms] of Object.entries(expected)) {
+      const text = byId.get(id)
+      if (text === undefined) {
+        return { passed: false, output: `no result for id "${id}": got ${[...byId.keys()]}` }
+      }
+      const lower = text.toLowerCase()
+      const hits = terms.filter((term) => lower.includes(term.toLowerCase()))
+      if (any ? hits.length === 0 : hits.length !== terms.length) {
+        const missing = terms.filter((term) => !hits.includes(term))
+        return {
+          passed: false,
+          output: `"${id}" is missing ${any ? 'any of' : ''} ${JSON.stringify(missing)}: ${text.slice(0, 160)}`
+        }
+      }
+    }
+    return { passed: true, output: `${Object.keys(expected).length} id(s) matched` }
+  },
+
+  /**
+   * Every named result was streamed, not just delivered.
+   *
+   * The batch's final results look the same whether the text arrived in one
+   * frame or in fifty, so a streaming test that only read the finals would
+   * pass with streaming switched off.
+   */
+  streamedEachId(value, args) {
+    const events = (Array.isArray(value) ? value : []) as Array<{
+      id?: string
+      event?: { type?: string; text?: string }
+    }>
+    const counts = new Map<string, number>()
+    for (const { id, event } of events) {
+      if (id === undefined) continue
+      if (event?.type === 'contentDelta' && (event.text ?? '').length > 0) {
+        counts.set(id, (counts.get(id) ?? 0) + 1)
+      }
+    }
+    const missing = ((args.ids ?? []) as string[]).filter((id) => (counts.get(id) ?? 0) === 0)
+    if (missing.length > 0) {
+      return { passed: false, output: `no streamed content for: ${missing.join(', ')}` }
+    }
+    return { passed: true, output: `streamed ${[...counts.values()].join('/')} delta(s)` }
+  },
+
+  /**
+   * These results made no tool call.
+   *
+   * The other half of `toolCallShape`: a batch where one prompt declares a
+   * tool and another does not is only answered if the second one stayed quiet.
+   */
+  noToolCallsFor(value, args) {
+    const results = (Array.isArray(value) ? value : []) as Array<{
+      id?: string
+      final?: { toolCalls?: Array<{ name?: string }> }
+    }>
+    for (const id of (args.ids ?? []) as string[]) {
+      const calls = results.find((result) => result.id === id)?.final?.toolCalls ?? []
+      if (calls.length > 0) {
+        return {
+          passed: false,
+          output: `"${id}" was expected to make no tool call, made: ${calls.map((c) => c.name).join(', ')}`
+        }
+      }
+    }
+    return { passed: true, output: `${(args.ids as string[]).length} id(s) stayed quiet` }
   },
 
   /**
@@ -843,6 +1123,10 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
     },
 
     async asset(kind, file, form) {
+      if (kind === 'bytes') {
+        if (form === 'path') throw new Error('synthesized bytes have no path')
+        return synthesizeBytes(file)
+      }
       if (kind === 'tone') {
         if (form === 'path') throw new Error('a synthesized tone has no path')
         return synthesizeTone(file)

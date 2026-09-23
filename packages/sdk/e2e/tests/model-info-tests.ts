@@ -1,10 +1,23 @@
-import type { TestDefinition } from '@qvac/test-suite'
+import type { Step, TestDefinition } from '@qvac/test-suite'
+
+/**
+ * A registry lookup by model constant, and a check that the record came back
+ * with the fields a cache lookup is asked for.
+ *
+ * `isCached` and `cacheFiles` are what the executor printed into its output
+ * string; naming them here is what turns a formatted line into a claim.
+ */
+const infoSteps: Step[] = [
+  { call: { method: 'getModelInfo', params: { name: '$params.modelConstant' }, as: 'info' } },
+  { assert: { on: '$info', named: 'fieldsPresent', with: { fields: ['isCached'] } } }
+]
 
 export const modelInfoGet: TestDefinition = {
   testId: 'model-info-get',
   params: { modelConstant: 'LLAMA_3_2_1B_INST_Q4_0' },
   expectation: { validation: 'type', expectedType: 'string' },
   suites: ['smoke'],
+  steps: infoSteps,
   metadata: { category: 'model-info', dependency: 'llm', estimatedDurationMs: 5000 }
 }
 
@@ -12,6 +25,11 @@ export const modelInfoVerifyFiles: TestDefinition = {
   testId: 'model-info-verify-files',
   params: { modelConstant: 'LLAMA_3_2_1B_INST_Q4_0' },
   expectation: { validation: 'type', expectedType: 'string' },
+  steps: [
+    ...infoSteps,
+    { project: { from: '$info', path: 'cacheFiles', as: 'files' } },
+    { assert: { on: '$files', named: 'lengthAtLeast', with: { length: 1 } } }
+  ],
   metadata: { category: 'model-info', dependency: 'llm', estimatedDurationMs: 5000 }
 }
 
@@ -19,14 +37,38 @@ export const modelInfoMultipleModels: TestDefinition = {
   testId: 'model-info-multiple-models',
   params: { models: ['LLAMA_3_2_1B_INST_Q4_0', 'GTE_LARGE_FP16'] },
   expectation: { validation: 'type', expectedType: 'string' },
+  steps: [
+    {
+      repeat: {
+        over: '$params.models',
+        as: 'name',
+        collectInto: 'infos',
+        steps: [{ call: { method: 'getModelInfo', params: { name: '$name' }, as: 'info' } }]
+      }
+    },
+    { assert: { on: '$infos', named: 'lengthIs', with: { length: 2 } } }
+  ],
   metadata: { category: 'model-info', dependency: 'llm+embeddings', estimatedDurationMs: 10000 }
 }
 
+/**
+ * Migrated as the executor ran it, which is not what the id says.
+ *
+ * The executor dispatched this to the same generic handler as
+ * `model-info-get`: it never unloaded anything, so the name has been promising
+ * more than the body checked. Spelling the unload out here does make the id
+ * true, but it also unloads a model the resource manager still believes is
+ * loaded, and the next test to declare `llm` then calls into a model that is
+ * gone. Making the name true needs the unload to go through the resource
+ * manager, which is a change to what tests may do to shared state -- and that
+ * is a decision, not a migration.
+ */
 export const modelInfoPersistsAfterUnload: TestDefinition = {
   testId: 'model-info-persists-after-unload',
   params: { modelConstant: 'LLAMA_3_2_1B_INST_Q4_0' },
   expectation: { validation: 'type', expectedType: 'string' },
   suites: ['smoke'],
+  steps: infoSteps,
   metadata: { category: 'model-info', dependency: 'llm', estimatedDurationMs: 5000 }
 }
 

@@ -28,6 +28,8 @@ from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any, Generic, TypeVar
 
 from ._api import generate_client_request_id
+from ._completion import _fold_events
+from .errors import CompletionFailedError
 from ._generated import methods as _methods
 from ._transport import Transport
 from .schemas import (
@@ -654,14 +656,35 @@ class BatchCompletionRun(StreamRun[Any]):
         super().__init__(request_id)
         loop = asyncio.get_running_loop()
         self.ids: asyncio.Future[list[Any]] = loop.create_future()
+        #: Per-prompt finals in prompt order, as JS's `results` gives them.
+        self.results: asyncio.Future[list[Any]] = loop.create_future()
 
     @property
     def events(self) -> AsyncIterator[Any]:
         return self.stream
 
-    @property
-    def results(self) -> asyncio.Future[list[Any]]:
-        return self.collected
+    def by_id(self, prompt_id: str) -> asyncio.Future[Any]:
+        """The final for one prompt, as JS's `byId(id).final` gives it."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+
+        def settle(_done: Any) -> None:
+            if future.done():
+                return
+            error = self.results.exception()
+            if error is not None:
+                future.set_exception(error)
+                return
+            for result in self.results.result():
+                if result["id"] == prompt_id:
+                    future.set_result(result["final"])
+                    return
+            future.set_exception(
+                CompletionFailedError(f'Unknown batch prompt id "{prompt_id}".')
+            )
+
+        self.results.add_done_callback(settle)
+        return future
 
 
 def batch_completion(
@@ -695,6 +718,27 @@ def batch_completion(
     run.done.add_done_callback(
         lambda _f: run.ids.done() or run.ids.set_result([]),
     )
+
+    def per_prompt(events: list[Any]) -> list[Any]:
+        """Fold the interleaved event stream into one final per prompt.
+
+        The wire carries `{id, event}` pairs for every prompt on one stream;
+        JS regroups them behind `results`, and without the same regrouping
+        here `results` would mean "the raw events" on Python and "the per
+        prompt finals" on JS -- the same catalog step reading two different
+        things.
+        """
+        grouped: dict[str, list[Any]] = {}
+        for item in events:
+            grouped.setdefault(item.id, []).append(item.event)
+        order = run.ids.result() if run.ids.done() else list(grouped)
+        results = []
+        for prompt_id in order:
+            final, _error, _cancelled = _fold_events(grouped.get(prompt_id, []), {})
+            results.append({"id": prompt_id, "final": final})
+        return results
+
+    _derive(run, run.results, per_prompt)
     return run
 
 
