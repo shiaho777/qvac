@@ -248,7 +248,12 @@ export class ResourceManager {
     return {
       ...(def.constant ? { modelSrc: def.constant } : {}),
       ...(def.modelSrc !== undefined ? { modelSrc: def.modelSrc } : {}),
-      ...(def.type ? { modelType: def.type } : {})
+      ...(def.type ? { modelType: def.type } : {}),
+      // The config was declared in this signature but never returned, so a
+      // test driving the load path itself got a source that loads a different
+      // model than the key names -- a Bergamot pair without its
+      // engine/from/to, for instance.
+      ...(def.config !== undefined ? { modelConfig: def.config } : {})
     }
   }
 

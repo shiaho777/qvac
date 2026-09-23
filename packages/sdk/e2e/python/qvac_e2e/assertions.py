@@ -18,6 +18,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+import json
+
 from .result import StepResult
 
 
@@ -78,6 +80,205 @@ def equals_joined(value: Any, args: dict[str, Any]) -> StepResult:
     if value != expected:
         return StepResult.fail(f"expected {expected!r}, got {value!r}")
     return StepResult.ok(f"{len(parts)} part(s) joined")
+
+
+def png_dimensions(value: Any, args: dict[str, Any]) -> StepResult:
+    """The PNG has exactly these dimensions.
+
+    What the per-test `validation: "function"` closures were checking. Those
+    cannot cross to another client -- a function is not data -- so the numbers
+    travel in `with` and the reading happens here.
+    """
+    raw = value[0] if isinstance(value, list) and value else value
+    data = _as_bytes(raw)
+    dims = _png_dimensions(data)
+    if dims is None:
+        return StepResult.fail(f"not a valid PNG ({len(data)} bytes)")
+    width, height = int(args.get("width", 0)), int(args.get("height", 0))
+    if dims != (width, height):
+        return StepResult.fail(f"expected {width}x{height}, got {dims[0]}x{dims[1]}")
+    return StepResult.ok(f"{dims[0]}x{dims[1]}")
+
+
+def non_negative_numbers(value: Any, args: dict[str, Any]) -> StepResult:
+    """These fields are numbers, and none of them is negative.
+
+    The phase timings a run reports: zero is a legitimate reading for a phase
+    that did no work, a negative one never is.
+    """
+    record = value if isinstance(value, dict) else {}
+    fields = args.get("fields") or []
+    for field in fields:
+        measured = record.get(field)
+        if (
+            not isinstance(measured, (int, float))
+            or isinstance(measured, bool)
+            or measured < 0
+        ):
+            return StepResult.fail(
+                f"{field} is not a non-negative number (got {measured!r})"
+            )
+    return StepResult.ok(f"{len(fields)} field(s) non-negative")
+
+
+def fields_sum_to(value: Any, args: dict[str, Any]) -> StepResult:
+    """The named fields add up to the total, within a tolerance.
+
+    A diffusion run reports per-phase timings and one generation time; if they
+    do not reconcile, one of the phases is not being accounted for. The
+    tolerance is there because the total is integer-valued while the phases
+    keep fractional milliseconds.
+    """
+    record = value if isinstance(value, dict) else {}
+    fields = args.get("fields") or []
+    total = sum(float(record.get(field) or 0) for field in fields)
+    expected_raw = record.get(str(args.get("total")))
+    if not isinstance(expected_raw, (int, float)) or isinstance(expected_raw, bool):
+        return StepResult.fail(f"{args.get('total')} is missing from the record")
+    expected = float(expected_raw)
+    tolerance = max(
+        float(args.get("minTolerance", 2)), expected * float(args.get("ratio", 0.01))
+    )
+    delta = abs(total - expected)
+    if delta > tolerance:
+        return StepResult.fail(
+            f"phases sum to {total:.2f}, {args.get('total')}={expected}, "
+            f"delta {delta:.2f}ms exceeds {tolerance:.2f}ms"
+        )
+    return StepResult.ok(f"phases reconcile within {delta:.2f}ms")
+
+
+def no_partial_downloads(value: Any, _args: dict[str, Any]) -> StepResult:
+    """The load was a cache hit: nothing was downloaded again.
+
+    A real download reports many partial-percentage events per file; a cache
+    hit reports at most a final one. Counting the partials is what makes "the
+    cache held" observable from outside, since neither client can see the cache
+    directory the way the engine does.
+    """
+    events = value if isinstance(value, list) else []
+    partials = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and (event.get("total") or 0) > 0
+        and (event.get("downloaded") or 0) < (event.get("total") or 0)
+    ]
+    if partials:
+        keys = {str(event.get("downloadKey")) for event in partials}
+        sample = ", ".join(
+            f"{event.get('downloadKey')}@{float(event.get('percentage') or 0):.0f}%"
+            for event in partials[:3]
+        )
+        return StepResult.fail(
+            f"re-downloaded {len(keys)} file(s), {len(partials)} partial "
+            f"event(s). First: {sample}"
+        )
+    return StepResult.ok(f"{len(events)} cache-hit notification(s)")
+
+
+def transcript_segments_shape(value: Any, _args: dict[str, Any]) -> StepResult:
+    """Transcript segments are well formed and in audio-time order.
+
+    Every field the consumer of a metadata transcription reads, plus the
+    ordering invariant: segments are emitted in audio time, and ids only go
+    forward. Out-of-order segments would reassemble into the wrong transcript
+    without any single segment looking wrong.
+    """
+    if not isinstance(value, list):
+        return StepResult.fail(f"expected an array, got {type(value).__name__}")
+    if not value:
+        return StepResult.fail("expected at least one segment")
+
+    previous_start = float("-inf")
+    previous_id = float("-inf")
+    for index, segment in enumerate(value):
+        if not isinstance(segment, dict):
+            return StepResult.fail(f"segment {index}: not an object")
+        start_ms = segment.get("startMs")
+        end_ms = segment.get("endMs")
+        if not isinstance(segment.get("text"), str):
+            return StepResult.fail(f"segment {index}: missing/invalid text")
+        if not isinstance(start_ms, (int, float)) or isinstance(start_ms, bool):
+            return StepResult.fail(f"segment {index}: missing/invalid startMs")
+        if not isinstance(end_ms, (int, float)) or isinstance(end_ms, bool):
+            return StepResult.fail(f"segment {index}: missing/invalid endMs")
+        if end_ms < start_ms:
+            return StepResult.fail(
+                f"segment {index}: endMs {end_ms} < startMs {start_ms}"
+            )
+        if not isinstance(segment.get("append"), bool):
+            return StepResult.fail(f"segment {index}: missing/invalid append")
+        segment_id = segment.get("id")
+        if not isinstance(segment_id, int) or isinstance(segment_id, bool):
+            return StepResult.fail(f"segment {index}: missing/invalid id")
+        if start_ms < previous_start:
+            return StepResult.fail(
+                f"segment {index}: out-of-order startMs {start_ms} < {previous_start}"
+            )
+        if segment_id < previous_id:
+            return StepResult.fail(
+                f"segment {index}: out-of-order id {segment_id} < {previous_id}"
+            )
+        previous_start = start_ms
+        previous_id = segment_id
+    return StepResult.ok(f"{len(value)} segment(s) in order")
+
+
+def event_type_counts(value: Any, args: dict[str, Any]) -> StepResult:
+    """The event stream carries the types this test expects, not the forbidden.
+
+    Counting by type is what all of these tests were doing by hand. `absent`
+    matters as much as `atLeast`: parakeet must not emit standalone `vad`
+    events, and a check that only looked for what it wanted would pass on a
+    client that emitted everything.
+    """
+    events = value if isinstance(value, list) else []
+    counts: dict[str, int] = {}
+    for event in events:
+        kind = str((event or {}).get("type", "unknown"))
+        counts[kind] = counts.get(kind, 0) + 1
+    summary = json.dumps(counts, sort_keys=True)
+
+    for kind, minimum in (args.get("atLeast") or {}).items():
+        if counts.get(kind, 0) < minimum:
+            return StepResult.fail(
+                f"expected at least {minimum} {kind} event(s), got {summary}"
+            )
+    for kind in args.get("absent") or []:
+        if counts.get(kind):
+            return StepResult.fail(
+                f"{kind} event(s) were emitted but must not be: {summary}"
+            )
+    return StepResult.ok(summary)
+
+
+def event_shape(value: Any, args: dict[str, Any]) -> StepResult:
+    """Every event of this type carries the right fields and not the others.
+
+    Parakeet's end-of-turn is token-driven and must declare
+    `source: "parakeet"` without a `silenceDurationMs`; that field is the
+    whisper variant, and a client that filled in both would be reporting a
+    shape no consumer can discriminate on.
+    """
+    events = value if isinstance(value, list) else []
+    kind = str(args.get("type"))
+    equals = args.get("equals") or {}
+    absent = args.get("absent") or []
+
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != kind:
+            continue
+        for field, expected in equals.items():
+            if event.get(field) != expected:
+                return StepResult.fail(
+                    f"{kind} event has {field}={event.get(field)!r}, "
+                    f"expected {expected!r}: {event}"
+                )
+        for field in absent:
+            if event.get(field) is not None:
+                return StepResult.fail(f"{kind} event must omit {field}: {event}")
+    return StepResult.ok(f"{kind} events well formed")
 
 
 def contains_all(value: Any, args: dict[str, Any]) -> StepResult:
@@ -654,6 +855,13 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "lengthAtLeast": length_at_least,
     "anyFieldPresent": any_field_present,
     "containsAll": contains_all,
+    "eventTypeCounts": event_type_counts,
+    "transcriptSegmentsShape": transcript_segments_shape,
+    "noPartialDownloads": no_partial_downloads,
+    "pngDimensions": png_dimensions,
+    "nonNegativeNumbers": non_negative_numbers,
+    "fieldsSumTo": fields_sum_to,
+    "eventShape": event_shape,
     "containsAny": contains_any,
     "equalsJoined": equals_joined,
     "isEmptyText": is_empty_text,
@@ -731,6 +939,60 @@ def different_bytes(left: Any, right: Any, _args: dict[str, Any]) -> StepResult:
     )
 
 
+def _png_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Width and height out of a PNG's IHDR, or None if it is not a PNG.
+
+    PNG byte length varies with content and compression, so the header is the
+    only reliable invariant for comparing two generated images.
+    """
+    signature = b"\x89PNG\r\n\x1a\n"
+    if len(data) < 24 or not data.startswith(signature):
+        return None
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    return width, height
+
+
+def _byte_diff_ratio(left: bytes, right: bytes) -> float:
+    """How much of the two buffers differs, as a fraction of the longer one."""
+    longest = max(len(left), len(right))
+    if longest == 0:
+        return 0.0
+    changed = abs(len(left) - len(right))
+    changed += sum(1 for a, b in zip(left, right) if a != b)
+    return changed / longest
+
+
+def image_diverges_from(left: Any, right: Any, args: dict[str, Any]) -> StepResult:
+    """Two images of the same size, far enough apart to prove the input mattered.
+
+    The img2img and fusion tests run the same prompt and seed twice, dropping
+    the reference image from one. A backend that silently ignored the reference
+    would produce two nearly identical outputs, so the claim is a floor on how
+    much they differ -- and equal dimensions first, because comparing a 512x512
+    against a 768x768 says nothing.
+    """
+    a, b = _as_bytes(left), _as_bytes(right)
+    if not a or not b:
+        return StepResult.fail(f"missing output ({len(a)} and {len(b)} bytes)")
+    da, db = _png_dimensions(a), _png_dimensions(b)
+    if da is None or db is None:
+        return StepResult.fail("one of the outputs is not a valid PNG")
+    if da != db:
+        return StepResult.fail(
+            f"dimensions differ: {da[0]}x{da[1]} vs {db[0]}x{db[1]} -- the "
+            "comparison is only meaningful at equal size"
+        )
+    ratio = _byte_diff_ratio(a, b)
+    minimum = float(args.get("minRatio", 0.01))
+    if ratio <= minimum:
+        return StepResult.fail(
+            f"outputs are {ratio * 100:.2f}% apart, at or below the "
+            f"{minimum * 100:.2f}% floor -- the input was probably dropped"
+        )
+    return StepResult.ok(f"{ratio * 100:.2f}% byte delta")
+
+
 def length_ratio_at_least(left: Any, right: Any, args: dict[str, Any]) -> StepResult:
     """The left value carries at least this many times the data of the right.
 
@@ -758,4 +1020,5 @@ COMPARISONS: dict[str, Any] = {
     "identicalBytes": identical_bytes,
     "differentBytes": different_bytes,
     "lengthRatioAtLeast": length_ratio_at_least,
+    "imageDivergesFrom": image_diverges_from,
 }

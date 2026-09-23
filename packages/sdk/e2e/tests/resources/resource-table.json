@@ -278,6 +278,18 @@
       "to": "fr"
     }
   },
+  "bergamot-fr-en": {
+    "constant": {
+      "$const": "BERGAMOT_FR_EN"
+    },
+    "type": "nmtcpp-translation",
+    "config": {
+      "engine": "Bergamot",
+      "from": "fr",
+      "to": "en"
+    },
+    "skipPreDownload": true
+  },
   "bergamot-en-es": {
     "constant": {
       "$const": "BERGAMOT_EN_ES"

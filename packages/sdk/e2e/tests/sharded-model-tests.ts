@@ -27,6 +27,33 @@ const SHARDED_MULTI_STEP = new Set([
   'sharded-model-llm-missing-shards'
 ])
 
+/** One embedding over the assembled sharded model. */
+const shardedEmbedSteps: Step[] = [
+  { useModel: { deps: ['sharded-embeddings'], as: 'model' } },
+  { call: { method: 'embed', params: { modelId: '$model', text: '$params.text' }, as: 'run' } },
+  { project: { from: '$run', path: 'embedding', as: 'embedding' } },
+  { assert: { on: '$embedding', use: 'expectation' } }
+]
+
+/** One completion over the assembled sharded LLM. */
+const shardedCompletionSteps = (as: string): Step[] => [
+  {
+    call: {
+      method: 'completion',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        history: '$params.history',
+        generationParams: '$params.generationParams?',
+        stream: false
+      },
+      as: `${as}Run`
+    }
+  },
+  { project: { from: `$${as}Run`, path: 'text', as } },
+  { assert: { on: `$${as}`, use: 'expectation' } }
+]
+
 export const shardedModelLoad: TestDefinition = {
   testId: 'sharded-model-load',
   params: {},
@@ -58,10 +85,29 @@ export const shardedModelHashValidation: TestDefinition = {
   }
 }
 
+/**
+ * The unsharded model still loads.
+ *
+ * The point is the load path's detection: an assembler that treated every
+ * model as sharded would fail here and nowhere else, so what is asserted is
+ * simply that a plain single-file model still comes back with an id.
+ */
 export const shardedModelBackwardCompatibility: TestDefinition = {
   testId: 'sharded-model-backward-compatibility',
   params: {},
   expectation: { validation: 'type', expectedType: 'string' },
+  steps: [
+    { modelSource: { dep: 'embeddings', as: 'src' } },
+    {
+      call: {
+        method: 'loadModel',
+        params: { modelSrc: '$src.modelSrc', modelType: '$src.modelType' },
+        as: 'loaded'
+      }
+    },
+    { project: { from: '$loaded', path: 'modelId', as: 'modelId' } },
+    { assert: { on: '$modelId', use: 'expectation' } }
+  ],
   metadata: { category: 'sharded-model', dependency: 'none', estimatedDurationMs: 60000 }
 }
 
@@ -103,6 +149,7 @@ export const shardedModelInference: TestDefinition = {
   params: { text: 'This is a test sentence for embedding generation using a sharded model.' },
   expectation: { validation: 'type', expectedType: 'array' },
   suites: ['smoke'],
+  steps: shardedEmbedSteps,
   metadata: {
     category: 'sharded-model',
     dependency: 'sharded-embeddings',
@@ -120,6 +167,25 @@ export const shardedModelBatchInference: TestDefinition = {
     ]
   },
   expectation: { validation: 'type', expectedType: 'array' },
+  // One call per text, collected: the executor looped and pushed, which is a
+  // `repeat` with the loop variable named.
+  steps: [
+    { useModel: { deps: ['sharded-embeddings'], as: 'model' } },
+    {
+      repeat: {
+        over: '$params.texts',
+        as: 'text',
+        collectInto: 'embeddings',
+        steps: [
+          { call: { method: 'embed', params: { modelId: '$model', text: '$text' }, as: 'run' } },
+          { project: { from: '$run', path: 'embedding', as: 'embedding' } }
+        ]
+      }
+    },
+    { assert: { on: '$embeddings', named: 'lengthIs', with: { length: 3 } } },
+    { project: { from: '$embeddings', path: '[0]', as: 'first' } },
+    { assert: { on: '$first', use: 'expectation' } }
+  ],
   metadata: {
     category: 'sharded-model',
     dependency: 'sharded-embeddings',
@@ -131,6 +197,7 @@ export const shardedModelLongTextInference: TestDefinition = {
   testId: 'sharded-model-long-text-inference',
   params: { text: 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '.repeat(20) },
   expectation: { validation: 'type', expectedType: 'array' },
+  steps: shardedEmbedSteps,
   metadata: {
     category: 'sharded-model',
     dependency: 'sharded-embeddings',
@@ -159,6 +226,10 @@ export const shardedModelLlmCompletion: TestDefinition = {
     generationParams: { temp: 0, seed: 42 }
   },
   expectation: { validation: 'contains-all', contains: ['4'] },
+  steps: [
+    { useModel: { deps: ['sharded-llm'], as: 'model' } },
+    ...shardedCompletionSteps('answer')
+  ],
   metadata: {
     category: 'sharded-model',
     dependency: 'sharded-llm',
@@ -173,6 +244,17 @@ export const shardedModelLlmReload: TestDefinition = {
     generationParams: { temp: 0, seed: 42 }
   },
   expectation: { validation: 'contains-all', contains: ['4'] },
+  // Answer, drop the model, answer again. The eviction goes through the
+  // resource manager rather than `unloadModel`, so the second `useModel`
+  // reassembles the shards instead of handing back an id the worker has
+  // forgotten -- which is the whole thing being tested.
+  steps: [
+    { useModel: { deps: ['sharded-llm'], as: 'model' } },
+    ...shardedCompletionSteps('before'),
+    { call: { method: 'evictResource', params: { dep: 'sharded-llm' } } },
+    { useModel: { deps: ['sharded-llm'], as: 'model' } },
+    ...shardedCompletionSteps('after')
+  ],
   metadata: {
     category: 'sharded-model',
     dependency: 'sharded-llm',
@@ -184,6 +266,17 @@ export const shardedModelLlmMissingShards: TestDefinition = {
   testId: 'sharded-model-llm-missing-shards',
   params: { modelPath: '/invalid/path/sharded-model-00001-of-00005.gguf' },
   expectation: { validation: 'throws-error', errorContains: 'Missing shards or' },
+  steps: [
+    {
+      callError: {
+        method: 'loadModel',
+        params: { modelSrc: '$params.modelPath', modelType: 'llamacpp-completion' },
+        as: 'err'
+      }
+    },
+    { project: { from: '$err', path: 'message', as: 'message' } },
+    { assert: { on: '$message', use: 'expectation' } }
+  ],
   metadata: {
     category: 'sharded-model',
     dependency: 'none',

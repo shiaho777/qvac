@@ -140,6 +140,11 @@ class ResourceManager:
             out["modelSrc"] = definition["modelSrc"]
         if definition.get("type"):
             out["modelType"] = definition["type"]
+        # Without the config a test driving the load path itself gets a source
+        # that loads a different model than the key names -- a Bergamot pair
+        # with no engine/from/to, for instance.
+        if definition.get("config") is not None:
+            out["modelConfig"] = definition["config"]
         return out
 
     async def ensure_loaded(self, dep: str) -> str:
@@ -163,6 +168,22 @@ class ResourceManager:
         )
         self._loaded[dep] = model_id
         return model_id
+
+    async def evict(self, dep: str) -> None:
+        """Unload one resource and forget it.
+
+        Distinct from unloading the model id directly: a test that reloads a
+        model has to take the resource manager with it, or the next `useModel`
+        hands back an id the worker no longer knows.
+        """
+        model_id = self._loaded.pop(dep, None)
+        if model_id is None:
+            return
+        self._log(f"evicting {dep}")
+        try:
+            await unload_model(self._transport, model_id)
+        except Exception as error:  # noqa: BLE001 - eviction must not fail a test
+            self._log(f"evicting {dep} failed (continuing): {error}")
 
     async def evict_all_except(self, keep: set[str]) -> None:
         for dep in [d for d in self._loaded if d not in keep]:

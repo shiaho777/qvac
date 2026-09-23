@@ -48,6 +48,11 @@ const TRANSCRIPTION_MULTI_STEP = new Set([
   'transcription-metadata-streaming'
 ])
 
+/** Closes whatever session the body opened, on both paths. */
+const destroySession: Step[] = [
+  { call: { method: 'transcribeStreamDestroy', params: { sessionId: '$sessionId?' } } }
+]
+
 const createTranscriptionTest = (
   testId: string,
   audioFileName: string,
@@ -226,6 +231,19 @@ export const transcriptionMetadataBatch: TestDefinition = {
   testId: 'transcription-metadata-batch',
   params: { audioFileName: 'transcription-short-wav.wav', metadata: true },
   expectation: { validation: 'function', fn: () => true },
+  steps: [
+    { useModel: { deps: ['whisper'], as: 'model' } },
+    { asset: { kind: 'audio', file: '$params.audioFileName', form: 'path', as: 'audio' } },
+    {
+      call: {
+        method: 'transcribe',
+        params: { modelId: '$model', audioChunk: '$audio', metadata: true },
+        as: 'run'
+      }
+    },
+    { project: { from: '$run', path: 'text', as: 'segments' } },
+    { assert: { on: '$segments', named: 'transcriptSegmentsShape' } }
+  ],
   metadata: {
     category: 'transcription',
     dependency: 'whisper',
@@ -241,6 +259,46 @@ export const transcriptionMetadataStreaming: TestDefinition = {
     chunkMs: 100
   },
   expectation: { validation: 'function', fn: () => true },
+  // The same segment contract as the batch case, over a live session: a
+  // streaming transcript that arrived out of audio-time order would reassemble
+  // wrong without any one segment looking wrong.
+  steps: [
+    { useModel: { deps: ['whisper'], as: 'model' } },
+    { asset: { kind: 'audio', file: '$params.audioFileName', as: 'audio' } },
+    {
+      call: {
+        method: 'transcribeStreamOpen',
+        params: { modelId: '$model', metadata: true },
+        as: 'session'
+      }
+    },
+    { project: { from: '$session', path: 'sessionId', as: 'sessionId' } },
+    {
+      call: {
+        method: 'transcribeStreamWrite',
+        params: {
+          sessionId: '$sessionId',
+          audio: '$audio',
+          sampleFormat: 'f32le',
+          pace: false,
+          chunkMs: '$params.chunkMs',
+          trailingSilenceMs: '$params.trailingSilenceMs'
+        }
+      }
+    },
+    { call: { method: 'transcribeStreamEnd', params: { sessionId: '$sessionId' } } },
+    {
+      call: {
+        method: 'transcribeStreamDrain',
+        collect: 'events',
+        params: { sessionId: '$sessionId' },
+        as: 'drained'
+      }
+    },
+    { project: { from: '$drained', path: 'events', as: 'segments' } },
+    { assert: { on: '$segments', named: 'transcriptSegmentsShape' } }
+  ],
+  finally: destroySession,
   metadata: {
     category: 'transcription',
     dependency: 'whisper',
@@ -277,7 +335,5 @@ export const transcriptionTests = [
 for (const test of transcriptionTests) {
   if (test.steps || TRANSCRIPTION_MULTI_STEP.has(test.testId)) continue
   test.steps =
-    test.expectation.validation === 'throws-error'
-      ? transcriptionRejects()
-      : transcriptionSteps()
+    test.expectation.validation === 'throws-error' ? transcriptionRejects() : transcriptionSteps()
 }

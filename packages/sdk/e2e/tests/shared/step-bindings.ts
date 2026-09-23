@@ -49,6 +49,7 @@ import {
 } from '@qvac/sdk'
 import { StepIncompleteError, type CollectMode, type StepBindings } from '@qvac/test-suite'
 import type { ResourceManager } from './resource-manager.js'
+import { decodeWavToMonoF32, f32ToLeBytes } from './wav-pcm.js'
 
 /**
  * How the shared step interpreter reaches this SDK.
@@ -82,7 +83,27 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
   vlaSetEmbodiment: (params) => vlaSetEmbodiment(params),
 
   // --- models --------------------------------------------------------------
-  loadModel: async (params) => ({ modelId: await loadModel(params) }),
+  /**
+   * Loads a model, and optionally records what the loader reported on the way.
+   *
+   * `withProgress` is how a step asks for the `onProgress` callback a catalog
+   * cannot pass: the events are collected here and handed back as data. It is
+   * the only way to tell a cache hit from a re-download from outside -- a hit
+   * reports at most a final 100% per file, a real download reports partials.
+   */
+  loadModel: async (params: never) => {
+    const p = params as { withProgress?: boolean }
+    if (!p.withProgress) return { modelId: await loadModel(params) }
+    const progress: unknown[] = []
+    const { withProgress: _ignored, ...rest } = p as Record<string, unknown>
+    const modelId = await loadModel({
+      ...(rest as Parameters<typeof loadModel>[0]),
+      onProgress: (event: unknown) => {
+        progress.push(event)
+      }
+    } as never)
+    return { modelId, progress }
+  },
   unloadModel: (params) => unloadModel(params),
   getModelInfo: (params) => getModelInfo(params),
   getLoadedModelInfo: (params) => getLoadedModelInfo(params),
@@ -169,6 +190,113 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
 
   // --- plugins -------------------------------------------------------------
   invokePlugin: async (params) => ({ result: await invokePlugin(params) }),
+
+  // --- transcription sessions ----------------------------------------------
+  //
+  // `transcribeStream` is a duplex session: open it, write audio, end the
+  // input, then read events off it. A step can only name a method and pass
+  // data, so the session stays in this registry and the catalog addresses it
+  // by the id given out here -- the same shape the vector index takes, for the
+  // same reason.
+  transcribeStreamOpen: async (params: never) => {
+    const p = params as Record<string, unknown>
+    // `transcribeStream` is overloaded on its parameters and TypeScript picks
+    // the pull-stream signature for a `never`; the duplex session is what it
+    // actually returns for these calls.
+    const session = (await transcribeStream(p as never)) as unknown as TranscribeSession
+    const sessionId = `session-${++transcribeSessionSeq}`
+    TRANSCRIBE_SESSIONS.set(sessionId, session)
+    return { sessionId }
+  },
+
+  /**
+   * Feeds a WAV fixture in, paced.
+   *
+   * Parakeet's stream session is built for live audio and only emits segments
+   * when the feed is wall-clock paced -- flooding the duplex RPC with the
+   * whole clip at once comes back with nothing. `chunkMs` is therefore both
+   * the chunk size and the delay between chunks, and `trailingSilenceMs` is
+   * the pad that lets end-of-turn detection fire.
+   */
+  transcribeStreamWrite: async (params: never) => {
+    const p = params as {
+      sessionId: string
+      audio: Uint8Array
+      chunkMs: number
+      trailingSilenceMs?: number
+      sampleFormat?: 's16le' | 'f32le'
+      expectSampleRate?: number
+      pace?: boolean
+    }
+    const session = transcribeSession(p.sessionId)
+    const decoded = decodeWavToMonoF32(p.audio)
+    const expected = p.expectSampleRate ?? 16000
+    if (decoded.sampleRate !== expected) {
+      throw new Error(`fixture sample rate ${decoded.sampleRate} != expected ${expected}`)
+    }
+    const bytesPerSample = p.sampleFormat === 'f32le' ? 4 : 2
+    const speech =
+      p.sampleFormat === 'f32le'
+        ? f32ToLeBytes(decoded.samplesMono)
+        : f32ToS16LeBytes(decoded.samplesMono)
+    const silenceSamples = Math.floor(((p.trailingSilenceMs ?? 0) / 1000) * decoded.sampleRate)
+    const silence = new Uint8Array(silenceSamples * bytesPerSample)
+    const chunkSize = Math.floor((p.chunkMs / 1000) * decoded.sampleRate) * bytesPerSample
+    const delay = p.pace === false ? 0 : p.chunkMs
+
+    let chunks = 0
+    for (const bytes of [speech, silence]) {
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        session.write(bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)))
+        chunks++
+        if (delay > 0 && offset + chunkSize < bytes.length) {
+          await new Promise((resolve) => setTimeout(resolve, delay))
+        }
+      }
+    }
+    return { chunks, bytes: speech.byteLength + silence.byteLength }
+  },
+
+  /** Writes a fixed number of chunks and stops, for the teardown tests. */
+  transcribeStreamWriteChunks: async (params: never) => {
+    const p = params as { sessionId: string; audio: Uint8Array; chunkMs: number; chunks: number }
+    const session = transcribeSession(p.sessionId)
+    const decoded = decodeWavToMonoF32(p.audio)
+    const speech = f32ToS16LeBytes(decoded.samplesMono)
+    const chunkSize = Math.floor((p.chunkMs / 1000) * decoded.sampleRate) * 2
+    let written = 0
+    for (let i = 0; i < p.chunks; i++) {
+      const offset = i * chunkSize
+      if (offset >= speech.length) break
+      session.write(speech.subarray(offset, Math.min(offset + chunkSize, speech.length)))
+      written++
+    }
+    return { chunks: written }
+  },
+
+  transcribeStreamEnd: async (params: never) => {
+    transcribeSession((params as { sessionId: string }).sessionId).end()
+    return { ended: true }
+  },
+
+  /**
+   * Tears the session down and forgets it.
+   *
+   * Tolerant of a session already gone: teardown runs on the failure path too,
+   * and a body that failed before opening one must not fail again here.
+   */
+  transcribeStreamDestroy: async (params: never) => {
+    const p = params as { sessionId?: string }
+    const session = p.sessionId ? TRANSCRIBE_SESSIONS.get(p.sessionId) : undefined
+    if (!session) return { destroyed: false }
+    TRANSCRIBE_SESSIONS.delete(p.sessionId as string)
+    try {
+      session.destroy()
+    } catch {
+      // Already torn down by the iterator; nothing to undo.
+    }
+    return { destroyed: true }
+  },
 
   // --- world ---------------------------------------------------------------
   worldCreateScene: async (params: never) => {
@@ -287,33 +415,8 @@ const STREAMS: Record<string, Fold> = {
     throw unsupported('textToSpeech', collect)
   },
 
-  diffusion: async (params, collect) => {
-    const run = diffusion(params)
-    if (collect === 'events') {
-      // Draining progress before awaiting the outputs is not a style choice:
-      // the generator is the live side of the same stream, and awaiting first
-      // would leave nothing to iterate.
-      const events = await drain(run.progressStream)
-      await run.outputs
-      return { events }
-    }
-    if (collect === 'all') return { all: await run.outputs }
-    if (collect === 'last') {
-      const outputs = await run.outputs
-      return { last: outputs.at(-1) }
-    }
-    throw unsupported('diffusion', collect)
-  },
-
-  upscale: async (params, collect) => {
-    const run = upscale(params)
-    if (collect === 'all') return { all: await run.outputs }
-    if (collect === 'last') {
-      const outputs = await run.outputs
-      return { last: outputs.at(-1) }
-    }
-    throw unsupported('upscale', collect)
-  },
+  diffusion: async (params, collect) => imagesRun(diffusion(params), collect, 'diffusion'),
+  upscale: async (params, collect) => imagesRun(upscale(params), collect, 'upscale'),
 
   audioGen: async (params, collect) => audioRun(audioGen(params), collect, 'audioGen'),
   audioEdit: async (params, collect) => audioRun(audioEdit(params), collect, 'audioEdit'),
@@ -371,6 +474,34 @@ const STREAMS: Record<string, Fold> = {
     throw unsupported('finetune', collect)
   },
 
+  /**
+   * Reads the session's events to the end, or up to `abortAfter` of them.
+   *
+   * `abortAfter` is the consumer-disconnect path: the iterator is thrown into
+   * after that many events, which must unwind the native session cleanly. A
+   * body that merely stopped reading would prove nothing -- the question is
+   * what happens when the consumer goes away mid-stream.
+   */
+  transcribeStreamDrain: async (params, collect) => {
+    const p = params as unknown as { sessionId: string; abortAfter?: number }
+    if (collect !== 'events') throw unsupported('transcribeStreamDrain', collect)
+    const session = transcribeSession(p.sessionId)
+    const events: Record<string, unknown>[] = []
+    const iterator = session[Symbol.asyncIterator]()
+    for (;;) {
+      const next = await iterator.next()
+      if (next.done) break
+      events.push(normaliseTranscribeEvent(next.value))
+      if (p.abortAfter !== undefined && events.length >= p.abortAfter) {
+        // `throw` rather than `return`: the contract under test is that the
+        // session unwinds when the consumer errors, not when it finishes.
+        await iterator.throw?.(new Error('consumer aborted the stream'))
+        break
+      }
+    }
+    return { events, stats: session.stats ? await session.stats : undefined }
+  },
+
   invokePluginStream: async (params, collect) => {
     const chunks = await drain(invokePluginStream(params))
     if (collect === 'all') return { all: chunks }
@@ -378,6 +509,43 @@ const STREAMS: Record<string, Fold> = {
     if (collect === 'text') return { text: chunks.map((c) => String(c)).join('') }
     throw unsupported('invokePluginStream', collect)
   }
+}
+
+/**
+ * `diffusion` and `upscale` return the same handle, so they fold the same.
+ *
+ * Every fold carries the stats and the progress ticks beside the images: one
+ * generation is minutes of work, and a test that asked "did it report phase
+ * timings" through a second `collect` would be paying that twice to ask about
+ * the first run.
+ */
+async function imagesRun(
+  run: {
+    outputs: Promise<unknown[]>
+    // `upscale` reports no progress, so the field is optional rather than
+    // faked: a body that asked for `events` on it gets an empty list, which is
+    // the truth.
+    progressStream?: AsyncIterable<unknown>
+    stats: Promise<unknown>
+  },
+  collect: CollectMode,
+  method: string
+): Promise<unknown> {
+  if (collect !== 'events' && collect !== 'all' && collect !== 'last') {
+    throw unsupported(method, collect)
+  }
+  // Progress is drained first because the generator is the live side of the
+  // same stream; awaiting the outputs first would leave nothing to iterate.
+  // One `Promise.all` rather than sequential awaits, so a run that rejects
+  // does not leave a second promise unhandled.
+  const [events, outputs, stats] = await Promise.all([
+    run.progressStream ? drain(run.progressStream) : Promise.resolve([]),
+    run.outputs,
+    run.stats
+  ])
+  if (collect === 'events') return { events, all: outputs, stats }
+  if (collect === 'last') return { last: outputs.at(-1), events, stats }
+  return { all: outputs, events, stats }
 }
 
 /** `audioGen` and `audioEdit` return the same handle, so they fold the same. */
@@ -497,6 +665,55 @@ const ASSET_ROOTS: Record<string, string> = {
 }
 
 /**
+ * Open transcription sessions, by an id this client hands out.
+ *
+ * Unlike the vector index the worker assigns no id here, so one is minted:
+ * what matters is that the catalog can name the session it opened without
+ * holding the object.
+ */
+type TranscribeSession = {
+  write(chunk: Uint8Array): void
+  end(): void
+  destroy(): void
+  stats?: Promise<unknown>
+  [Symbol.asyncIterator](): AsyncIterator<unknown>
+}
+
+const TRANSCRIBE_SESSIONS = new Map<string, TranscribeSession>()
+let transcribeSessionSeq = 0
+
+const transcribeSession = (sessionId: string): TranscribeSession => {
+  const session = TRANSCRIBE_SESSIONS.get(sessionId)
+  if (!session) throw new Error(`transcription session "${sessionId}" is not open`)
+  return session
+}
+
+/** Signed 16-bit little-endian PCM, the form the parakeet stream takes. */
+const f32ToS16LeBytes = (samples: Float32Array): Uint8Array => {
+  const out = new Uint8Array(samples.length * 2)
+  const view = new DataView(out.buffer)
+  for (let i = 0; i < samples.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, samples[i] ?? 0))
+    view.setInt16(i * 2, Math.round(clamped * 32767), true)
+  }
+  return out
+}
+
+/**
+ * One event as the catalog sees it.
+ *
+ * The plain session yields bare strings and the conversation session yields
+ * records; both become `{ type, ... }` here so a body can count event types
+ * without knowing which mode the session was opened in -- and so the Python
+ * client, whose events are typed objects with snake_case fields, reports the
+ * same shape.
+ */
+const normaliseTranscribeEvent = (event: unknown): Record<string, unknown> => {
+  if (typeof event === 'string') return { type: 'text', text: event }
+  return { ...(event as Record<string, unknown>) }
+}
+
+/**
  * Live vector indexes, by the id the worker assigned.
  *
  * `createVectorIndex` returns an object with methods; a step can only name a
@@ -533,6 +750,30 @@ const asBytes = (value: unknown): Uint8Array => {
   }
   if (Array.isArray(value)) return Uint8Array.from(value.map((item) => Number(item) & 0xff))
   return new Uint8Array()
+}
+
+/**
+ * Width and height out of a PNG's IHDR, or nothing if it is not a PNG.
+ *
+ * PNG byte length varies with content and compression, so the header is the
+ * only reliable invariant for comparing two generated images.
+ */
+const readPngDimensions = (bytes: Uint8Array): { width: number; height: number } | undefined => {
+  const SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+  if (bytes.byteLength < 24) return undefined
+  for (const [index, byte] of SIGNATURE.entries()) if (bytes[index] !== byte) return undefined
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  return { width: view.getUint32(16, false), height: view.getUint32(20, false) }
+}
+
+/** How much of the two buffers differs, as a fraction of the longer one. */
+const byteDiffRatio = (left: Uint8Array, right: Uint8Array): number => {
+  const longest = Math.max(left.byteLength, right.byteLength)
+  if (longest === 0) return 0
+  let changed = Math.abs(left.byteLength - right.byteLength)
+  const shortest = Math.min(left.byteLength, right.byteLength)
+  for (let i = 0; i < shortest; i++) if (left[i] !== right[i]) changed++
+  return changed / longest
 }
 
 const sameBytes = (left: unknown, right: unknown): boolean => {
@@ -601,6 +842,44 @@ const COMPARISONS: Record<
   },
 
   /**
+   * Two images of the same size, and far enough apart to prove the input
+   * mattered.
+   *
+   * The img2img and fusion tests run the same prompt and seed twice, dropping
+   * the reference image from one. A backend that silently ignored the
+   * reference would produce two nearly identical outputs, so the claim is a
+   * floor on how much they differ -- and equal dimensions first, because
+   * comparing a 512x512 against a 768x768 says nothing.
+   */
+  imageDivergesFrom(left, right, args) {
+    const a = asBytes(left)
+    const b = asBytes(right)
+    if (a.byteLength === 0 || b.byteLength === 0) {
+      return { passed: false, output: `missing output (${a.byteLength} and ${b.byteLength} bytes)` }
+    }
+    const da = readPngDimensions(a)
+    const db = readPngDimensions(b)
+    if (!da || !db) {
+      return { passed: false, output: 'one of the outputs is not a valid PNG' }
+    }
+    if (da.width !== db.width || da.height !== db.height) {
+      return {
+        passed: false,
+        output: `dimensions differ: ${da.width}x${da.height} vs ${db.width}x${db.height} -- the comparison is only meaningful at equal size`
+      }
+    }
+    const ratio = byteDiffRatio(a, b)
+    const minimum = Number(args.minRatio ?? 0.01)
+    if (ratio <= minimum) {
+      return {
+        passed: false,
+        output: `outputs are ${(ratio * 100).toFixed(2)}% apart, at or below the ${(minimum * 100).toFixed(2)}% floor -- the input was probably dropped`
+      }
+    }
+    return { passed: true, output: `${(ratio * 100).toFixed(2)}% byte delta` }
+  },
+
+  /**
    * The left value carries at least this many times the data of the right.
    *
    * The strongest claim available about an output sample rate: the rate itself
@@ -659,6 +938,79 @@ const ASSERTIONS: Record<
       return { passed: false, output: `expected ${expected} element(s), got ${value.length}` }
     }
     return { passed: true, output: `${value.length} element(s)` }
+  },
+
+  /**
+   * The PNG has exactly these dimensions.
+   *
+   * What the per-test `validation: 'function'` closures were checking. Those
+   * cannot cross to another client -- a function is not data -- so the numbers
+   * travel in `with` and the reading happens here.
+   */
+  pngDimensions(value, args) {
+    const bytes = asBytes(Array.isArray(value) ? value[0] : value)
+    const dims = readPngDimensions(bytes)
+    if (!dims) {
+      return { passed: false, output: `not a valid PNG (${bytes.byteLength} bytes)` }
+    }
+    const [width, height] = [Number(args.width), Number(args.height)]
+    if (dims.width !== width || dims.height !== height) {
+      return {
+        passed: false,
+        output: `expected ${width}x${height}, got ${dims.width}x${dims.height}`
+      }
+    }
+    return { passed: true, output: `${dims.width}x${dims.height}` }
+  },
+
+  /**
+   * These fields are numbers, and none of them is negative.
+   *
+   * The phase timings a run reports: zero is a legitimate reading for a phase
+   * that did no work, a negative one never is.
+   */
+  nonNegativeNumbers(value, args) {
+    const record = (value ?? {}) as Record<string, unknown>
+    for (const field of (args.fields ?? []) as string[]) {
+      const measured = record[field]
+      if (typeof measured !== 'number' || !Number.isFinite(measured) || measured < 0) {
+        return {
+          passed: false,
+          output: `${field} is not a non-negative number (got ${JSON.stringify(measured)})`
+        }
+      }
+    }
+    return { passed: true, output: `${(args.fields as string[]).length} field(s) non-negative` }
+  },
+
+  /**
+   * The named fields add up to the total, within a tolerance.
+   *
+   * A diffusion run reports per-phase timings and one generation time; if they
+   * do not reconcile, one of the phases is not being accounted for. The
+   * tolerance is there because the total is integer-valued while the phases
+   * keep fractional milliseconds.
+   */
+  fieldsSumTo(value, args) {
+    const record = (value ?? {}) as Record<string, number>
+    const fields = (args.fields ?? []) as string[]
+    const total = fields.reduce((sum, field) => sum + Number(record[field] ?? 0), 0)
+    const expected = Number(record[String(args.total)] ?? NaN)
+    if (!Number.isFinite(expected)) {
+      return { passed: false, output: `${String(args.total)} is missing from the record` }
+    }
+    const tolerance = Math.max(
+      Number(args.minTolerance ?? 2),
+      expected * Number(args.ratio ?? 0.01)
+    )
+    const delta = Math.abs(total - expected)
+    if (delta > tolerance) {
+      return {
+        passed: false,
+        output: `phases sum to ${total.toFixed(2)}, ${String(args.total)}=${expected}, delta ${delta.toFixed(2)}ms exceeds ${tolerance.toFixed(2)}ms`
+      }
+    }
+    return { passed: true, output: `phases reconcile within ${delta.toFixed(2)}ms` }
   },
 
   /**
@@ -979,6 +1331,171 @@ const ASSERTIONS: Record<
       }
     }
     return { passed: true, output: `${parts.length} part(s) joined` }
+  },
+
+  /**
+   * The load was a cache hit: nothing was downloaded again.
+   *
+   * A real download reports many partial-percentage events per file; a cache
+   * hit reports at most a final one. Counting the partials is what makes "the
+   * cache held" observable from outside, since neither client can see the
+   * cache directory the way the engine does.
+   */
+  noPartialDownloads(value) {
+    const events = (Array.isArray(value) ? value : []) as Array<{
+      total?: number
+      downloaded?: number
+      percentage?: number
+      downloadKey?: string
+    }>
+    const partials = events.filter(
+      (event) => (event.total ?? 0) > 0 && (event.downloaded ?? 0) < (event.total ?? 0)
+    )
+    if (partials.length > 0) {
+      const keys = new Set(partials.map((event) => String(event.downloadKey)))
+      const sample = partials
+        .slice(0, 3)
+        .map((event) => `${String(event.downloadKey)}@${Number(event.percentage ?? 0).toFixed(0)}%`)
+        .join(', ')
+      return {
+        passed: false,
+        output: `re-downloaded ${keys.size} file(s), ${partials.length} partial event(s). First: ${sample}`
+      }
+    }
+    return { passed: true, output: `${events.length} cache-hit notification(s)` }
+  },
+
+  /**
+   * Transcript segments are well formed and in audio-time order.
+   *
+   * Every field the consumer of a metadata transcription reads, plus the
+   * ordering invariant: segments are emitted in audio time, and ids only go
+   * forward. Out-of-order segments would reassemble into the wrong transcript
+   * without any single segment looking wrong.
+   */
+  transcriptSegmentsShape(value) {
+    const segments = value as Array<Record<string, unknown>>
+    if (!Array.isArray(segments)) {
+      return { passed: false, output: `expected an array, got ${typeof value}` }
+    }
+    if (segments.length === 0) {
+      return { passed: false, output: 'expected at least one segment' }
+    }
+
+    let previousStart = -Infinity
+    let previousId = -Infinity
+    for (const [index, segment] of segments.entries()) {
+      if (typeof segment !== 'object' || segment === null) {
+        return { passed: false, output: `segment ${index}: not an object` }
+      }
+      const startMs = segment['startMs']
+      const endMs = segment['endMs']
+      if (typeof segment['text'] !== 'string') {
+        return { passed: false, output: `segment ${index}: missing/invalid text` }
+      }
+      if (typeof startMs !== 'number' || !Number.isFinite(startMs)) {
+        return { passed: false, output: `segment ${index}: missing/invalid startMs` }
+      }
+      if (typeof endMs !== 'number' || !Number.isFinite(endMs)) {
+        return { passed: false, output: `segment ${index}: missing/invalid endMs` }
+      }
+      if (endMs < startMs) {
+        return { passed: false, output: `segment ${index}: endMs ${endMs} < startMs ${startMs}` }
+      }
+      if (typeof segment['append'] !== 'boolean') {
+        return { passed: false, output: `segment ${index}: missing/invalid append` }
+      }
+      const id = segment['id']
+      if (typeof id !== 'number' || !Number.isInteger(id)) {
+        return { passed: false, output: `segment ${index}: missing/invalid id` }
+      }
+      if (startMs < previousStart) {
+        return {
+          passed: false,
+          output: `segment ${index}: out-of-order startMs ${startMs} < ${previousStart}`
+        }
+      }
+      if (id < previousId) {
+        return { passed: false, output: `segment ${index}: out-of-order id ${id} < ${previousId}` }
+      }
+      previousStart = startMs
+      previousId = id
+    }
+    return { passed: true, output: `${segments.length} segment(s) in order` }
+  },
+
+  /**
+   * The event stream carries the types this test expects, and not the ones it
+   * forbids.
+   *
+   * Counting by type is what all of these tests were doing by hand. `absent`
+   * matters as much as `atLeast`: parakeet must not emit standalone `vad`
+   * events, and a check that only looked for what it wanted would pass on a
+   * client that emitted everything.
+   */
+  eventTypeCounts(value, args) {
+    const events = (Array.isArray(value) ? value : []) as Array<{ type?: string }>
+    const counts: Record<string, number> = {}
+    for (const event of events) {
+      const type = String(event.type ?? 'unknown')
+      counts[type] = (counts[type] ?? 0) + 1
+    }
+    const summary = JSON.stringify(counts)
+
+    for (const [type, minimum] of Object.entries((args.atLeast ?? {}) as Record<string, number>)) {
+      if ((counts[type] ?? 0) < minimum) {
+        return {
+          passed: false,
+          output: `expected at least ${minimum} ${type} event(s), got ${summary}`
+        }
+      }
+    }
+    for (const type of (args.absent ?? []) as string[]) {
+      if (counts[type]) {
+        return {
+          passed: false,
+          output: `${type} event(s) were emitted but must not be: ${summary}`
+        }
+      }
+    }
+    return { passed: true, output: summary }
+  },
+
+  /**
+   * Every event of this type carries the fields it should, and none of the
+   * fields belonging to the other half of the union.
+   *
+   * Parakeet's end-of-turn is token-driven and must declare
+   * `source: "parakeet"` without a `silenceDurationMs`; that field is the
+   * whisper variant, and a client that filled in both would be reporting a
+   * shape no consumer can discriminate on.
+   */
+  eventShape(value, args) {
+    const events = (Array.isArray(value) ? value : []) as Array<Record<string, unknown>>
+    const type = String(args.type)
+    const equals = (args.equals ?? {}) as Record<string, unknown>
+    const absent = (args.absent ?? []) as string[]
+
+    for (const event of events) {
+      if (event.type !== type) continue
+      for (const [field, expected] of Object.entries(equals)) {
+        if (event[field] !== expected) {
+          return {
+            passed: false,
+            output: `${type} event has ${field}=${JSON.stringify(event[field])}, expected ${JSON.stringify(expected)}: ${JSON.stringify(event)}`
+          }
+        }
+      }
+      for (const field of absent) {
+        if (event[field] !== undefined) {
+          return {
+            passed: false,
+            output: `${type} event must omit ${field}: ${JSON.stringify(event)}`
+          }
+        }
+      }
+    }
+    return { passed: true, output: `${type} events well formed` }
   },
 
   /**
@@ -1361,6 +1878,18 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
     },
 
     async call(method, params, collect) {
+      /**
+       * Unloads one resource and forgets it, through the resource manager.
+       *
+       * Not an SDK method, and deliberately not in the tables below: a reload
+       * test has to put the model back where the manager can find it, and
+       * unloading the id directly would leave the manager handing out an id
+       * the worker no longer knows. The manager is only in scope here.
+       */
+      if (method === 'evictResource') {
+        await resources.evict(String((params as { dep: string }).dep))
+        return { evicted: true }
+      }
       if (collect) {
         const stream = STREAMS[method]
         if (!stream) {

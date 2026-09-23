@@ -19,7 +19,8 @@ import re
 import sys
 from array import array
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from contextlib import suppress
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from typing import Any
 
 from tetherto.qvac_sdk import (
@@ -61,6 +62,7 @@ from tetherto.qvac_sdk import (
     state,
     suspend,
     transcribe,
+    transcribe_stream_session,
     audio_edit,
     audio_gen,
     audio_understand,
@@ -83,6 +85,7 @@ from tetherto.qvac_sdk import (
 from .assertions import ASSERTIONS, COMPARISONS
 from .resources import ASSET_ROOT, ResourceManager, UnknownResourceError
 from .result import StepResult
+from .wav_pcm import decode_wav_to_mono_f32, f32_to_le_bytes, f32_to_s16_le_bytes
 from .validation import validate
 
 
@@ -97,6 +100,185 @@ from .validation import validate
 #
 # Deliberately explicit rather than reflective: a typo in a step should be an
 # `incomplete` with a clear reason, not an attribute error deep in a stream.
+#: Open transcription sessions, by an id this client hands out. The worker
+#: assigns none, so one is minted: what matters is that the catalog can name
+#: the session it opened without holding the object.
+_TRANSCRIBE_SESSIONS: dict[str, Any] = {}
+_TRANSCRIBE_SESSION_SEQ = 0
+
+#: Conversation events arrive as frozen dataclasses with snake_case fields,
+#: where JS yields plain records. Renamed here so a catalog body reads one
+#: shape on both clients.
+_EVENT_FIELDS = {
+    "silence_duration_ms": "silenceDurationMs",
+    "is_end_of_turn": "isEndOfTurn",
+    "start_ms": "startMs",
+    "end_ms": "endMs",
+    "starts_word": "startsWord",
+}
+
+
+def _normalise_transcribe_event(event: Any) -> dict[str, Any]:
+    """One event as the catalog sees it.
+
+    The plain session yields bare strings and the conversation session yields
+    typed objects; both become `{"type": ...}` records so a body can count
+    event types without knowing which mode the session was opened in.
+    """
+    if isinstance(event, str):
+        return {"type": "text", "text": event}
+    if is_dataclass(event) and not isinstance(event, type):
+        raw = asdict(event)
+    elif isinstance(event, dict):
+        raw = dict(event)
+    else:
+        raw = {"type": type(event).__name__, "value": _jsonable(event)}
+    return {
+        _EVENT_FIELDS.get(key, key): _jsonable(value)
+        for key, value in raw.items()
+        if value is not None
+    }
+
+
+def _transcribe_session(session_id: str) -> Any:
+    session = _TRANSCRIBE_SESSIONS.get(session_id)
+    if session is None:
+        raise StepError(f'transcription session "{session_id}" is not open')
+    return session
+
+
+async def _transcribe_stream_open(transport: Any, params: dict[str, Any]) -> Any:
+    global _TRANSCRIBE_SESSION_SEQ
+    session = transcribe_stream_session(
+        transport,
+        model_id=params["modelId"],
+        metadata=params.get("metadata", False),
+        emit_vad_events=params.get("emitVadEvents", False),
+        end_of_turn_silence_ms=params.get("endOfTurnSilenceMs"),
+        parakeet_streaming_config=params.get("parakeetStreamingConfig"),
+    )
+    _TRANSCRIBE_SESSION_SEQ += 1
+    session_id = f"session-{_TRANSCRIBE_SESSION_SEQ}"
+    _TRANSCRIBE_SESSIONS[session_id] = session
+    return {"sessionId": session_id}
+
+
+async def _transcribe_stream_write(transport: Any, params: dict[str, Any]) -> Any:
+    """Feeds a WAV fixture in, paced.
+
+    Parakeet's stream session is built for live audio and only emits segments
+    when the feed is wall-clock paced -- flooding the duplex RPC with the whole
+    clip at once comes back with nothing. `chunkMs` is therefore both the chunk
+    size and the delay between chunks, and `trailingSilenceMs` is the pad that
+    lets end-of-turn detection fire.
+    """
+    session = _transcribe_session(params["sessionId"])
+    decoded = decode_wav_to_mono_f32(bytes(params["audio"]))
+    expected = params.get("expectSampleRate", 16000)
+    if decoded.sample_rate != expected:
+        raise StepError(
+            f"fixture sample rate {decoded.sample_rate} != expected {expected}"
+        )
+    chunk_ms = params["chunkMs"]
+    wide = params.get("sampleFormat") == "f32le"
+    bytes_per_sample = 4 if wide else 2
+    speech = (
+        f32_to_le_bytes(decoded.samples_mono)
+        if wide
+        else f32_to_s16_le_bytes(decoded.samples_mono)
+    )
+    silence_samples = int(
+        params.get("trailingSilenceMs", 0) / 1000 * decoded.sample_rate
+    )
+    silence = bytes(silence_samples * bytes_per_sample)
+    chunk_size = int(chunk_ms / 1000 * decoded.sample_rate) * bytes_per_sample
+    delay = 0 if params.get("pace") is False else chunk_ms / 1000
+
+    chunks = 0
+    for payload in (speech, silence):
+        for offset in range(0, len(payload), chunk_size):
+            session.write(payload[offset : offset + chunk_size])
+            chunks += 1
+            if delay > 0 and offset + chunk_size < len(payload):
+                await asyncio.sleep(delay)
+    return {"chunks": chunks, "bytes": len(speech) + len(silence)}
+
+
+async def _transcribe_stream_write_chunks(
+    transport: Any, params: dict[str, Any]
+) -> Any:
+    """Writes a fixed number of chunks and stops, for the teardown tests."""
+    session = _transcribe_session(params["sessionId"])
+    decoded = decode_wav_to_mono_f32(bytes(params["audio"]))
+    speech = f32_to_s16_le_bytes(decoded.samples_mono)
+    chunk_size = int(params["chunkMs"] / 1000 * decoded.sample_rate) * 2
+    written = 0
+    for index in range(params["chunks"]):
+        offset = index * chunk_size
+        if offset >= len(speech):
+            break
+        session.write(speech[offset : offset + chunk_size])
+        written += 1
+    return {"chunks": written}
+
+
+async def _transcribe_stream_end(transport: Any, params: dict[str, Any]) -> Any:
+    _transcribe_session(params["sessionId"]).end()
+    return {"ended": True}
+
+
+async def _transcribe_stream_destroy(transport: Any, params: dict[str, Any]) -> Any:
+    """Tears the session down and forgets it.
+
+    Tolerant of a session already gone: teardown runs on the failure path too,
+    and a body that failed before opening one must not fail again here.
+    """
+    session_id = params.get("sessionId")
+    session = _TRANSCRIBE_SESSIONS.pop(session_id, None) if session_id else None
+    if session is None:
+        return {"destroyed": False}
+    try:
+        await session.aclose()
+    except Exception:  # noqa: BLE001 - already torn down by the iterator
+        pass
+    return {"destroyed": True}
+
+
+async def _transcribe_stream_drain(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
+    """Reads the session's events to the end, or up to `abortAfter` of them.
+
+    `abortAfter` is the consumer-disconnect path: the iterator is thrown into
+    after that many events, which must unwind the session cleanly. A body that
+    merely stopped reading would prove nothing -- the question is what happens
+    when the consumer goes away mid-stream.
+    """
+    if collect != "events":
+        raise StepError(
+            f'collect: "{collect}" is not defined for transcribeStreamDrain',
+            incomplete=True,
+        )
+    session = _transcribe_session(params["sessionId"])
+    abort_after = params.get("abortAfter")
+    events: list[dict[str, Any]] = []
+    iterator = session.__aiter__()
+    while True:
+        try:
+            event = await iterator.__anext__()
+        except StopAsyncIteration:
+            break
+        events.append(_normalise_transcribe_event(event))
+        if abort_after is not None and len(events) >= abort_after:
+            # `athrow` rather than `aclose`: the contract under test is that
+            # the session unwinds when the consumer errors, not when it
+            # finishes.
+            with suppress(BaseException):
+                await iterator.athrow(RuntimeError("consumer aborted the stream"))
+            break
+    return {"events": events, "stats": _jsonable(session.stats)}
+
+
 async def _vector_index_search(transport: Any, params: dict[str, Any]) -> Any:
     """One query against an index, folded the way JS folds it.
 
@@ -252,6 +434,23 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
         VectorIndexRequest, "vectorIndex", vector_index, operation="dispose"
     ),
     "vectorIndexSearch": _vector_index_search,
+    # --- transcription sessions ---------------------------------------------
+    #
+    # `transcribe_stream_session` is a duplex session: open it, write audio,
+    # end the input, then read events off it. A step can only name a method and
+    # pass data, so the session stays in a registry here and the catalog
+    # addresses it by the id handed out -- the same shape the vector index
+    # takes, for the same reason.
+    "transcribeStreamOpen": _transcribe_stream_open,
+    "transcribeStreamWrite": _transcribe_stream_write,
+    "transcribeStreamWriteChunks": _transcribe_stream_write_chunks,
+    "transcribeStreamEnd": _transcribe_stream_end,
+    "transcribeStreamDestroy": _transcribe_stream_destroy,
+    # --- the harness's own surface ------------------------------------------
+    #
+    # Not an SDK call: a reload test has to put the model back where the
+    # resource manager can find it, and unloading the id directly would leave
+    # the manager handing out an id the worker no longer knows.
     "finetune": _request(FinetuneRequest, "finetune", finetune),
     # --- plugins -------------------------------------------------------------
     "invokePlugin": lambda transport, params: invoke_plugin(
@@ -272,7 +471,17 @@ def _snake(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _load_model(transport: Any, params: dict[str, Any]) -> Any:
+    """Loads a model, and optionally records what the loader reported.
+
+    `withProgress` is how a step asks for the `on_progress` callback a catalog
+    cannot pass: the events are collected here and handed back as data. It is
+    the only way to tell a cache hit from a re-download from outside -- a hit
+    reports at most a final 100% per file, a real download reports partials.
+    """
+
     async def run() -> dict[str, Any]:
+        progress: list[Any] = []
+        want_progress = bool(params.get("withProgress"))
         model_id = await load_model(
             transport,
             model_src=params.get("modelSrc"),
@@ -280,9 +489,14 @@ def _load_model(transport: Any, params: dict[str, Any]) -> Any:
             model_config=params.get("modelConfig"),
             model_name=params.get("modelName"),
             model_id=params.get("modelId"),
+            on_progress=(lambda event: progress.append(_jsonable(event)))
+            if want_progress
+            else None,
         )
         # JS binds `{ modelId }` so a later step can project it; matching that
         # here keeps one definition working on both clients.
+        if want_progress:
+            return {"modelId": model_id, "progress": progress}
         return {"modelId": model_id}
 
     return run()
@@ -449,22 +663,40 @@ async def _tts_stream(transport: Any, params: dict[str, Any], collect: str) -> A
 
 
 async def _images_stream(run: Any, collect: str, method: str) -> Any:
-    """diffusion and upscale return the same run shape, so they fold alike."""
-    if collect == "events":
-        # Drain progress before awaiting the outputs: the generator is the live
-        # side of the same stream, and awaiting first would leave nothing to
-        # iterate.
-        events = [tick async for tick in run.progress_stream]
-        await run.outputs
-        return {"events": events}
-    if collect == "all":
-        return {"all": await run.outputs}
-    if collect == "last":
-        outputs = await run.outputs
-        return {"last": outputs[-1] if outputs else None}
-    raise StepError(
-        f'collect: "{collect}" is not defined for {method}', incomplete=True
+    """diffusion and upscale return the same run shape, so they fold alike.
+
+    Every fold carries the stats and the progress ticks beside the images: one
+    generation is minutes of work, and a test that asked "did it report phase
+    timings" with a second `collect` would be paying that twice to ask about
+    the first run.
+    """
+    if collect not in ("events", "all", "last"):
+        raise StepError(
+            f'collect: "{collect}" is not defined for {method}', incomplete=True
+        )
+    # Progress is drained first because the generator is the live side of the
+    # same stream; awaiting the outputs first would leave nothing to iterate.
+    # `gather` rather than sequential awaits, so a run that fails does not
+    # leave the second result unretrieved.
+    # `upscale` reports no progress, so an absent stream folds to an empty
+    # list rather than a fake tick -- which is the truth about that run.
+    progress = getattr(run, "progress_stream", None)
+    events, outputs, stats = await asyncio.gather(
+        _drain(progress) if progress is not None else _nothing(),
+        run.outputs,
+        run.stats,
     )
+    stats = _jsonable(stats)
+    events = _jsonable(events)
+    if collect == "events":
+        return {"events": events, "all": outputs, "stats": stats}
+    if collect == "last":
+        return {
+            "last": outputs[-1] if outputs else None,
+            "events": events,
+            "stats": stats,
+        }
+    return {"all": outputs, "events": events, "stats": stats}
 
 
 async def _diffusion_stream(
@@ -486,6 +718,11 @@ async def _upscale_stream(transport: Any, params: dict[str, Any], collect: str) 
         repeats=params.get("repeats"),
     )
     return await _images_stream(run, collect, "upscale")
+
+
+async def _nothing() -> list[Any]:
+    """An empty result, for a handle that has no stream to drain."""
+    return []
 
 
 async def _drain(stream: Any) -> list[Any]:
@@ -655,6 +892,7 @@ STREAMS: dict[str, Callable[[Any, dict[str, Any], str], Any]] = {
     "batchCompletion": _batch_completion_stream,
     "worldStep": _world_step_stream,
     "invokePluginStream": _plugin_stream,
+    "transcribeStreamDrain": _transcribe_stream_drain,
 }
 
 # Streaming methods the Python SDK still has no run handle for.
@@ -1142,6 +1380,15 @@ class Interpreter:
         coroutine to a task instead.
         """
         method = body["method"]
+        # Not an SDK call, and deliberately not in CALLS: a reload test has to
+        # put the model back where the resource manager can find it, and
+        # unloading the id directly would leave the manager handing out an id
+        # the worker no longer knows. The manager belongs to the interpreter,
+        # so this is the one method dispatched from here.
+        if method == "evictResource":
+            evicted = self._call_params(body.get("params"), scope)
+            await self._resources.evict(str(evicted["dep"]))
+            return {"evicted": True}
         call = CALLS.get(method)
         collect = body.get("collect")
         # A streaming method lives in STREAMS, not CALLS, so a step that asks
@@ -1243,9 +1490,7 @@ class Interpreter:
             value = join.join(str(v) for v in value)
         if body.get("count"):
             if not isinstance(value, (list, tuple, bytes, bytearray)):
-                raise StepError(
-                    f'project count: "{body["path"]}" is not a list'
-                )
+                raise StepError(f'project count: "{body["path"]}" is not a list')
             value = len(value)
         scope[body["as"]] = value
         return None

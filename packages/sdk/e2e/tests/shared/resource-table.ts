@@ -220,6 +220,20 @@ export const RESOURCE_TABLE: ResourceTable = {
     }
   },
 
+  /**
+   * The reverse pair, used only by the cache-reload test.
+   *
+   * Not pre-downloaded: that test warms the cache itself in its first round
+   * and asserts the second is a pure hit, so fetching it up front would be
+   * doing the test's first half for it.
+   */
+  'bergamot-fr-en': {
+    constant: { $const: 'BERGAMOT_FR_EN' },
+    type: 'nmtcpp-translation',
+    config: { engine: 'Bergamot', from: 'fr', to: 'en' },
+    skipPreDownload: true
+  },
+
   'bergamot-en-es': {
     constant: { $const: 'BERGAMOT_EN_ES' },
     type: 'nmtcpp-translation',
