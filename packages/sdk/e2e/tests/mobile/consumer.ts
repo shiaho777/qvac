@@ -1,43 +1,7 @@
 import { Platform } from 'react-native'
 import { createExecutor, SkipExecutor } from '@qvac/test-suite/mobile'
 import type { TestDefinition } from '@qvac/test-suite'
-import {
-  profiler,
-  LLAMA_3_2_1B_INST_Q4_0,
-  LLAMA_3_2_1B_INST_Q4_0_SHARD,
-  GTE_LARGE_FP16,
-  GTE_LARGE_335M_FP16_SHARD,
-  WHISPER_TINY,
-  VAD_SILERO_5_1_2,
-  QWEN3_1_7B_INST_Q4,
-  OCR_CRAFT,
-  OCR_LATIN,
-  BERGAMOT_EN_FR,
-  BERGAMOT_EN_ES,
-  BERGAMOT_ES_EN,
-  BERGAMOT_EN_IT,
-  MARIAN_EN_HI_INDIC_200M_Q4_0,
-  MARIAN_HI_EN_INDIC_200M_Q4_0,
-  TTS_T3_TURBO_EN_CHATTERBOX_Q4_0,
-  TTS_S3GEN_EN_CHATTERBOX_Q4_0,
-  TTS_INDIC_MULTILINGUAL_PARLER_TTS_Q8_0,
-  TTS_MINI_V1_EN_PARLER_TTS_Q8_0,
-  TTS_COSYVOICE3_LLM_COSYVOICE_Q8_0,
-  TTS_LM_MULTILINGUAL_AUDIO8_Q8_0,
-  TTS_CODEC_DECODER_AUDIO8_Q8_0,
-  TTS_EN_SUPERTONIC_Q8_0,
-  TTS_MULTILINGUAL_SUPERTONIC3_Q4_0,
-  TTS_ENHANCER_LAVASR_FP16,
-  TTS_DENOISER_LAVASR_FP16,
-  PARAKEET_TDT_0_6B_V3_Q4_0,
-  PARAKEET_CTC_0_6B_Q4_0,
-  PARAKEET_UNIFIED_0_6B_Q4_0,
-  PARAKEET_SORTFORMER_4SPK_V2_1_Q4_0,
-  PARAKEET_EOU_120M_V1_Q4_0,
-  VISIONPSY_NANO_460M_MULTIMODAL_Q4_K_M,
-  MMPROJ_VISIONPSY_NANO_460M_MULTIMODAL_Q8_0,
-  SMOLVLA_LIBERO_VISION_Q8
-} from '@qvac/sdk'
+import { profiler } from '@qvac/sdk'
 import { ResourceManager } from '../shared/resource-manager.js'
 import { collectTestDeps } from '../shared/collect-test-deps.js'
 import { resolveBundledAssetUri } from './asset-uri.js'

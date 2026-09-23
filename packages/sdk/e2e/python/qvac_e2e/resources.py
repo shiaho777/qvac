@@ -1,7 +1,7 @@
 """Resource key -> model, and the load/evict lifecycle around a test.
 
-The table itself is no longer written here. `tests/catalog/resources.json` is
-the shared copy every client reads, because a definition that says
+The table itself is no longer written here. `tests/resources/resource-table.json`
+is the shared copy every client reads, because a definition that says
 `useModel: { deps: ["whisper"] }` only means the same thing on two clients if
 both resolve `whisper` to the same model with the same config. What stays here
 is the part that cannot be data: turning a `$const` name into this SDK's model
@@ -25,7 +25,10 @@ from tetherto.qvac_sdk import models as model_constants
 # a catalog somewhere else without editing code.
 _TABLE_PATH = Path(
     os.environ.get("QVAC_RESOURCE_TABLE")
-    or Path(__file__).resolve().parents[2] / "tests" / "catalog" / "resources.json"
+    or Path(__file__).resolve().parents[2]
+    / "tests"
+    / "resources"
+    / "resource-table.json"
 )
 
 # Where `$asset` placeholders point on this platform.
@@ -74,7 +77,16 @@ def _resolve(value: Any) -> Any:
             return constant
         asset = value.get("$asset")
         if isinstance(asset, dict):
-            return str(ASSET_ROOT / asset["kind"] / asset["file"])
+            base = (ASSET_ROOT / asset["kind"]).resolve()
+            resolved = (base / asset["file"]).resolve()
+            # Same containment rule as the `asset` step: the table is shared
+            # data, so a fixture name that climbs out of its root is refused.
+            if base != resolved and base not in resolved.parents:
+                raise MissingConstantError(
+                    f'asset "{asset["file"]}" resolves outside the '
+                    f'"{asset["kind"]}" asset root'
+                )
+            return str(resolved)
         return {key: _resolve(item) for key, item in value.items()}
     return value
 
