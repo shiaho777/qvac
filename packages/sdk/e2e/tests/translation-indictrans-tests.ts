@@ -1,4 +1,28 @@
-import type { TestDefinition, Expectation } from '@qvac/test-suite'
+import type { Expectation, Step, TestDefinition } from '@qvac/test-suite'
+
+/**
+ * One NMT translation. The model carries its own language pair, so unlike the
+ * LLM-backed translations there is no `from`/`to` to pass -- which is exactly
+ * the distinction the executor used to decide which call to make.
+ */
+const nmtSteps = (dependency: string): Step[] => [
+  { useModel: { deps: [dependency], as: 'model' } },
+  {
+    call: {
+      method: 'translate',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        text: '$params.text',
+        modelType: 'nmtcpp-translation',
+        stream: false
+      },
+      as: 'run'
+    }
+  },
+  { project: { from: '$run', path: 'text', as: 'text' } },
+  { assert: { on: '$text', use: 'expectation' } }
+]
 
 const createIndicTransTest = (
   testId: string,
@@ -160,3 +184,14 @@ export const translationIndicTransTests = [
   indictransHiEnStreaming,
   indictransHiEnStats
 ]
+
+/**
+ * Attach the body to every definition that is one translation. A test naming
+ * several texts, or comparing two runs, keeps its hand-written body.
+ */
+for (const test of translationIndicTransTests) {
+  if (test.steps) continue
+  const params = test.params as { text?: unknown; texts?: unknown }
+  if (typeof params.text !== 'string' || params.texts !== undefined) continue
+  test.steps = nmtSteps(String(test.metadata?.dependency ?? ''))
+}

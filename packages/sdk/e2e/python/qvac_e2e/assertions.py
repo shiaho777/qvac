@@ -237,6 +237,18 @@ def produced_audio(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{samples} sample(s)")
 
 
+def is_true(value: Any, args: dict[str, Any]) -> StepResult:
+    """The value is exactly `True`.
+
+    For the operations whose whole answer is "it worked": the executors turned
+    that into the string "success" and matched it against `type: string`, which
+    is satisfied by "failed" just as well.
+    """
+    if value is not True:
+        return StepResult.fail(f"expected true, got {value!r}")
+    return StepResult.ok("true")
+
+
 def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """`getLoadedModelInfo` returned a record describing the model we loaded.
 
@@ -283,5 +295,6 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "textBlockShape": text_block_shape,
     "timingStatsPresent": timing_stats_present,
     "producedAudio": produced_audio,
+    "isTrue": is_true,
     "loadedModelInfoShape": loaded_model_info_shape,
 }

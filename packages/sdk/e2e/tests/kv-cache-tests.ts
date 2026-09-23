@@ -1,4 +1,62 @@
-import type { TestDefinition } from '@qvac/test-suite'
+import type { Step, TestDefinition } from '@qvac/test-suite'
+
+/** Deleting a cache: by key, by key and model, or the whole cache root. */
+const deleteCacheSteps = (): Step[] => [
+  {
+    call: {
+      method: 'deleteCache',
+      params: {
+        all: '$params.deleteAll?',
+        kvCacheKey: '$params.kvCacheKey?',
+        modelId: '$params.modelIdToDelete?'
+      },
+      as: 'result'
+    }
+  },
+  { project: { from: '$result', path: 'success', as: 'success' } },
+  { assert: { on: '$success', named: 'isTrue' } }
+]
+
+/** One completion that reuses a named cache. */
+const kvCompletionSteps = (): Step[] => [
+  { useModel: { deps: ['llm'], as: 'model' } },
+  {
+    call: {
+      method: 'completion',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        history: '$params.history',
+        stream: '$params.stream?',
+        kvCache: '$params.kvCache?',
+        tools: '$params.tools?'
+      },
+      as: 'run'
+    }
+  },
+  { project: { from: '$run', path: 'text', as: 'text' } },
+  { assert: { on: '$text', use: 'expectation' } }
+]
+
+/**
+ * Bodies that are about what happens BETWEEN runs -- a cache deleted then
+ * reused, two sessions switched, a cancelled run that must leave the committed
+ * cache intact, several completions racing for one cache path. One call is not
+ * what they are about, so they keep their hand-written bodies.
+ */
+const KV_CACHE_MULTI_RUN = new Set([
+  'kv-cache-delete-and-reuse',
+  'kv-cache-session-switch',
+  'kv-cache-different-system-prompts',
+  'kv-cache-stats-verification',
+  'kv-cache-remove-thinking-compaction',
+  'kv-cache-tools-sequential-save',
+  'kv-cache-cancel-then-new-prompt',
+  'kv-cache-cancel-keeps-committed-cache',
+  'kv-cache-concurrent-same-key',
+  'kv-cache-concurrent-same-key-auto',
+  'kv-cache-auto-concurrency'
+])
 
 export const kvCacheDeleteAll: TestDefinition = {
   testId: 'kv-cache-delete-all',
@@ -381,3 +439,14 @@ export const kvCacheTests = [
   kvCacheToolsSequentialSave,
   kvCacheCancelThenNewPrompt
 ]
+
+/**
+ * Attach a body on the same conditions the executor dispatched on: a delete
+ * operation, or a completion that names a cache.
+ */
+for (const test of kvCacheTests) {
+  if (test.steps || KV_CACHE_MULTI_RUN.has(test.testId)) continue
+  const isDelete =
+    test.testId.startsWith('kv-cache-delete-') || test.testId === 'kv-cache-hypercore-deletion'
+  test.steps = isDelete ? deleteCacheSteps() : kvCompletionSteps()
+}

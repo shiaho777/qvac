@@ -1,4 +1,4 @@
-import type { TestDefinition } from '@qvac/test-suite'
+import type { Step, TestDefinition } from '@qvac/test-suite'
 
 type ParakeetDependency =
   | 'parakeet-tdt'
@@ -6,6 +6,39 @@ type ParakeetDependency =
   | 'parakeet-sortformer'
   | 'parakeet-indic-conformer'
   | 'parakeet-unified'
+
+/**
+ * One parakeet transcription. Same shape as the whisper ones; the difference
+ * is which model the test names, which the resource key already says.
+ */
+const parakeetSteps = (dependency: string): Step[] => [
+  { useModel: { deps: [dependency], as: 'model' } },
+  { asset: { kind: 'audio', file: '$params.audioFileName', form: 'path', as: 'audio' } },
+  {
+    call: {
+      method: 'transcribe',
+      params: { modelId: '$model', audioChunk: '$audio', metadata: '$params.metadata?' },
+      as: 'run'
+    }
+  },
+  { project: { from: '$run', path: 'text', as: 'text' } },
+  { assert: { on: '$text', use: 'expectation' } }
+]
+
+/** A parakeet call the test expects to be refused. */
+const parakeetRejects = (dependency: string): Step[] => [
+  { useModel: { deps: [dependency], as: 'model' } },
+  { asset: { kind: 'audio', file: '$params.audioFileName', form: 'path', as: 'audio' } },
+  {
+    callError: {
+      method: 'transcribe',
+      params: { modelId: '$model', audioChunk: '$audio', metadata: '$params.metadata?' },
+      as: 'err'
+    }
+  },
+  { project: { from: '$err', path: 'message', as: 'message' } },
+  { assert: { on: '$message', use: 'expectation' } }
+]
 
 const createParakeetTest = (
   testId: string,
@@ -270,3 +303,16 @@ export const parakeetTests = [
   ...parakeetIndicConformerTests,
   ...parakeetSortformerTests
 ]
+
+/**
+ * Attach a body to every parakeet definition, on the same condition the
+ * executor branched on: whether the test is waiting for a rejection.
+ */
+for (const test of parakeetTests) {
+  if (test.steps) continue
+  const dependency = String(test.metadata?.dependency ?? 'parakeet-tdt')
+  const expectsRejection =
+    test.expectation.validation === 'throws-error' ||
+    (test.params as { metadata?: boolean }).metadata === true
+  test.steps = expectsRejection ? parakeetRejects(dependency) : parakeetSteps(dependency)
+}

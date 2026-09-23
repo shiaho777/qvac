@@ -627,6 +627,20 @@ const ASSERTIONS: Record<
     return { passed: true, output: `${samples} sample(s)` }
   },
 
+  /**
+   * The value is exactly `true`.
+   *
+   * For the operations whose whole answer is "it worked": the executors turned
+   * that into the string "success" and matched it against `type: string`,
+   * which is satisfied by "failed" just as well.
+   */
+  isTrue(value) {
+    if (value !== true) {
+      return { passed: false, output: `expected true, got ${JSON.stringify(value)}` }
+    }
+    return { passed: true, output: 'true' }
+  },
+
   loadedModelInfoShape(value, args) {
     const info = value as {
       modelId?: string
