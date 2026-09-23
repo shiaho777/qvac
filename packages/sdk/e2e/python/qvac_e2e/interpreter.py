@@ -13,8 +13,13 @@ the JS client; bypassing it would prove only that the worker works.
 
 from __future__ import annotations
 
+import asyncio
+import math
 import re
+import sys
+from array import array
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Any
 
 from tetherto.qvac_sdk import (
@@ -409,10 +414,31 @@ async def _upscale_stream(transport: Any, params: dict[str, Any], collect: str) 
     return await _images_stream(run, collect, "upscale")
 
 
+async def _drain(stream: Any) -> list[Any]:
+    """Collect an async iterable, the way JS's `drain()` does."""
+    return [item async for item in stream]
+
+
 async def _audio_stream(run: Any, collect: str, method: str) -> Any:
     if collect == "pcm":
+        # Progress is drained alongside the audio rather than in a second fold:
+        # these tests ask whether one run produced audio *and* reported
+        # progress, and a second `collect` would be a second generation.
+        progress = asyncio.ensure_future(_drain(run.progress_stream))
         audio = await run.audio
-        return {"pcm": audio["data"], "stats": _jsonable(await run.stats)}
+        stats = _jsonable(await run.stats)
+        # `data` here, `pcm` in JS. Renamed so `$run.audio.pcm` is one thing in
+        # both clients rather than two spellings of the same bytes.
+        return {
+            "audio": {
+                "pcm": audio["data"],
+                "sampleRate": audio["sampleRate"],
+                "channels": audio["channels"],
+                "bitsPerSample": audio["bitsPerSample"],
+            },
+            "stats": stats,
+            "events": await progress,
+        }
     if collect == "events":
         events = [tick async for tick in run.progress_stream]
         await run.audio
@@ -604,6 +630,58 @@ class StepError(Exception):
         self.incomplete = incomplete
 
 
+#: A fixture the catalog names but no file holds: "2s-440hz" is two seconds of
+#: a 440 Hz tone. The audio tests feed a synthesized tone rather than a
+#: recording because the point is a known signal, not a performance.
+_TONE = re.compile(r"^(\d+(?:\.\d+)?)s-(\d+(?:\.\d+)?)hz$")
+
+#: The input format AudioGen accepts: interleaved stereo 48 kHz Float32 LE PCM.
+_TONE_SAMPLE_RATE = 48000
+_TONE_CHANNELS = 2
+
+
+def _synthesize_tone(spec: str) -> bytes:
+    """Raw interleaved stereo 48 kHz Float32 LE PCM for a named tone.
+
+    Kept beside the JS synthesizer in `tests/shared/step-bindings.ts`: "the
+    same source audio" only means something if both clients build the same
+    bytes from the same name.
+    """
+    match = _TONE.match(spec)
+    if match is None:
+        raise StepError(f'tone "{spec}" is not "<seconds>s-<frequency>hz"')
+    seconds, frequency = float(match.group(1)), float(match.group(2))
+    frames = round(_TONE_SAMPLE_RATE * seconds)
+    pcm = array("f")
+    for frame in range(frames):
+        sample = 0.1 * math.sin(2 * math.pi * frequency * frame / _TONE_SAMPLE_RATE)
+        for _ in range(_TONE_CHANNELS):
+            pcm.append(sample)
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    return pcm.tobytes()
+
+
+@dataclass
+class _Pending:
+    """A call `start` began and `settle` has yet to await.
+
+    Wrapped in a class rather than left as a bare task so a started call cannot
+    be mistaken for data: every other binding in scope is a value the test may
+    project or assert on.
+    """
+
+    task: asyncio.Future
+
+
+#: Where the run collects started calls, so none outlive the test.
+_STARTED = "__started"
+
+#: How long `start` lets the loop run before the next step. Long enough for the
+#: request to leave, short enough to be noise against any test that races one.
+_START_ON_WIRE_S = 0.05
+
+
 class Interpreter:
     def __init__(self, resources: ResourceManager, log) -> None:
         self._resources = resources
@@ -614,12 +692,16 @@ class Interpreter:
         steps: list[dict[str, Any]],
         params: dict[str, Any],
         expectation: dict[str, Any],
+        teardown: list[dict[str, Any]] | None = None,
     ) -> StepResult:
+        teardown = teardown or []
         # Evict anything this test did not declare before it starts, so a run
-        # does not depend on the order tests happened to arrive in.
+        # does not depend on the order tests happened to arrive in. Teardown
+        # counts as declaration: a test that unloads its model in `finally`
+        # must not have it evicted out from under the body.
         declared = {
             dep
-            for step in steps
+            for step in [*steps, *teardown]
             if "useModel" in step
             for dep in step["useModel"].get("deps", [])
         }
@@ -627,6 +709,28 @@ class Interpreter:
 
         scope: dict[str, Any] = {"params": params}
 
+        body = await self._run_body(steps, scope, expectation)
+        failed_teardown = await self._run_teardown(teardown, scope, expectation)
+        await self._drain_started(scope)
+        if failed_teardown is None:
+            return body
+        # A body that passed cannot be claimed on a client that could not clean
+        # up after it, so the teardown's verdict stands. A body that already
+        # failed keeps its own message -- that is the diagnosis -- and carries
+        # the teardown failure alongside it. Mirrors the JS interpreter.
+        if body.passed:
+            return failed_teardown
+        return replace(
+            body,
+            output=f"{body.output} [teardown also failed: {failed_teardown.output}]",
+        )
+
+    async def _run_body(
+        self,
+        steps: list[dict[str, Any]],
+        scope: dict[str, Any],
+        expectation: dict[str, Any],
+    ) -> StepResult:
         try:
             last_assert = await self._run_steps(steps, scope, expectation)
         except StepError as error:
@@ -639,6 +743,36 @@ class Interpreter:
         if last_assert is None:
             return StepResult.fail("test body ran but asserted nothing")
         return last_assert
+
+    async def _run_teardown(
+        self,
+        steps: list[dict[str, Any]],
+        scope: dict[str, Any],
+        expectation: dict[str, Any],
+    ) -> StepResult | None:
+        """Runs the teardown steps, returning only a failure.
+
+        Teardown runs on both paths, so a body that fails halfway still
+        restores the client. It shares the body scope: teardown usually needs
+        what the body bound, and a binding the body never reached is referenced
+        optionally.
+        """
+        if not steps:
+            return None
+        try:
+            # Teardown that asserts nothing is clean -- `resume()` is a
+            # restoration, not a claim, so `_run_body`'s "asserted nothing"
+            # rule must not apply here.
+            result = await self._run_steps(steps, scope, expectation)
+        except StepError as error:
+            result = (
+                StepResult.incomplete(str(error))
+                if error.incomplete
+                else StepResult.fail(str(error))
+            )
+        except Exception as error:  # noqa: BLE001 - any client error fails the test
+            result = StepResult.fail(f"{type(error).__name__}: {error}")
+        return None if result is None or result.passed else result
 
     async def _run_steps(
         self,
@@ -680,6 +814,10 @@ class Interpreter:
             return self._asset(body, scope)
         if op == "call":
             return await self._call(body, scope)
+        if op == "start":
+            return await self._start(body, scope)
+        if op == "settle":
+            return await self._settle(body, scope)
         if op == "callError":
             return await self._call_error(body, scope)
         if op == "repeat":
@@ -807,6 +945,13 @@ class Interpreter:
         # tests differ only in which fixture they use should carry one body and
         # name the file in its params.
         kind = str(self._resolve(body["kind"], scope))
+        if kind == "tone":
+            if body.get("form") == "path":
+                raise StepError("a synthesized tone has no path")
+            scope[body["as"]] = _synthesize_tone(
+                str(self._resolve(body["file"], scope))
+            )
+            return None
         root = self.ASSET_ROOTS.get(kind)
         if root is None:
             raise StepError(
@@ -858,7 +1003,12 @@ class Interpreter:
         scope.setdefault("model", model_ids[0])
         return None
 
-    async def _call(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
+    async def _call_value(self, body: dict[str, Any], scope: dict[str, Any]) -> Any:
+        """Performs one call and returns its value, without binding it.
+
+        Shared by `call`, which binds the value, and `start`, which hands the
+        coroutine to a task instead.
+        """
         method = body["method"]
         call = CALLS.get(method)
         collect = body.get("collect")
@@ -878,11 +1028,80 @@ class Interpreter:
         self._log(f"call {method}")
         response = await self._invoke(method, call, params, collect)
 
-        result = _jsonable(response)
+        return _jsonable(response)
 
-        name = body.get("as")
-        scope[name or "result"] = result
+    async def _call(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
+        scope[body.get("as") or "result"] = await self._call_value(body, scope)
         return None
+
+    async def _start(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
+        """Begins a call without waiting for it to finish.
+
+        The concurrency the imperative executors express by not awaiting.
+        Wrapped in a task that captures the outcome instead of raising, so a
+        started call nobody settles cannot surface as "Task exception was never
+        retrieved" during somebody else's test.
+        """
+        method = body["method"]
+        self._log(f"start {method}")
+        # The scope as it stands now. JS resolves the call's params before it
+        # creates the promise; the task here runs later, so without a snapshot
+        # a `$ref` would read whatever a step between `start` and `settle`
+        # rebound -- the two clients would disagree about the same body.
+        snapshot = dict(scope)
+
+        async def outcome() -> dict[str, Any]:
+            try:
+                return {"value": await self._call_value(body, snapshot)}
+            except BaseException as error:  # noqa: BLE001 - re-raised by settle
+                return {"error": error}
+
+        pending = _Pending(asyncio.ensure_future(outcome()))
+        scope[body["as"]] = pending
+        self._started(scope).append(pending)
+        # Gives the loop real time so the request reaches the wire before the
+        # next step runs. JS issues the call synchronously, so "started" there
+        # means sent; here the call travels through a chain of tasks -- this
+        # one, then the pump the SDK's run handle creates, then the transport
+        # write -- and a bare yield only advances the first link.
+        # `lifecycle-suspend-during-inference` is the test that can tell the
+        # difference: the completion it starts was being admitted *after* the
+        # suspend it is supposed to race, and the runtime refused it.
+        await asyncio.sleep(_START_ON_WIRE_S)
+        return None
+
+    async def _settle(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
+        """Waits for a call begun by `start`, re-raising its rejection here."""
+        handle = self._resolve(body["of"], scope)
+        if not isinstance(handle, _Pending):
+            raise StepError(f'settle: "{body["of"]}" is not a started call')
+        result = await handle.task
+        if "error" in result:
+            raise result["error"]
+        scope[body.get("as") or "result"] = result["value"]
+        return None
+
+    def _started(self, scope: dict[str, Any]) -> list[_Pending]:
+        """The run's started calls.
+
+        Lives in the scope so the copy `repeat` makes for each iteration shares
+        the same list -- a call started inside a loop is still the run's
+        responsibility.
+        """
+        return scope.setdefault(_STARTED, [])
+
+    async def _drain_started(self, scope: dict[str, Any]) -> None:
+        """Waits for every started call the test never settled.
+
+        An in-flight completion that outlives its test goes on holding the
+        model while the next test loads its own, and lands its result in the
+        middle of somebody else's run. Nothing here is reported: a call the
+        test never settled made no claim.
+        """
+        pending = scope.get(_STARTED)
+        if not pending:
+            return
+        await asyncio.gather(*(p.task for p in pending))
 
     def _project(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
         source = self._resolve(body["from"], scope)
@@ -980,6 +1199,10 @@ def _last_binding(steps: list[dict[str, Any]]) -> str | None:
             return step["project"]["as"]
         if "call" in step:
             return step["call"].get("as") or "result"
+        # `settle` binds a value; `start` binds an in-flight call, which is not
+        # something a loop can collect.
+        if "settle" in step:
+            return step["settle"].get("as") or "result"
         if "asset" in step:
             return step["asset"]["as"]
         if "modelSource" in step:

@@ -110,6 +110,7 @@ async def _execute(interpreter: Interpreter, request: dict[str, Any]) -> StepRes
             steps=steps,
             params=request.get("params") or {},
             expectation=request.get("expectation") or {},
+            teardown=request.get("finally") or [],
         )
     except Exception as error:  # noqa: BLE001 - never take the bridge down
         return StepResult.fail(f"{type(error).__name__}: {error}")

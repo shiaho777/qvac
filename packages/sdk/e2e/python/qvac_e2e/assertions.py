@@ -36,6 +36,21 @@ def length_is(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(value)} element(s)")
 
 
+def length_at_least(value: Any, args: dict[str, Any]) -> StepResult:
+    """The collection has at least this many elements.
+
+    The floor half of `length_is`: "the registry lists models" and "more than
+    one result came back" are the same check with a different bound, and a test
+    that pinned the exact count would fail whenever the registry grew.
+    """
+    if not isinstance(value, list):
+        return StepResult.fail(f"expected an array, got {type(value).__name__}")
+    minimum = int(args.get("length", 0))
+    if len(value) < minimum:
+        return StepResult.fail(f"expected at least {minimum}, got {len(value)}")
+    return StepResult.ok(f"{len(value)} element(s)")
+
+
 def fields_present(value: Any, args: dict[str, Any]) -> StepResult:
     """Every named field is present on the value.
 
@@ -330,6 +345,7 @@ def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
 
 ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "lengthIs": length_is,
+    "lengthAtLeast": length_at_least,
     "fieldsPresent": fields_present,
     "fieldsMatch": fields_match,
     "errorIsStructured": error_is_structured,

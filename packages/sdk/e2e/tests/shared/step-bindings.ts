@@ -42,7 +42,9 @@ import {
   vlaHparams,
   vlaSetEmbodiment,
   worldCreateScene,
-  worldStep
+  worldStep,
+  AUDIOGEN_INPUT_SAMPLE_RATE,
+  AUDIOGEN_INPUT_CHANNELS
 } from '@qvac/sdk'
 import { StepIncompleteError, type CollectMode, type StepBindings } from '@qvac/test-suite'
 import type { ResourceManager } from './resource-manager.js'
@@ -325,7 +327,32 @@ async function audioRun(
   collect: CollectMode,
   method: string
 ): Promise<unknown> {
-  if (collect === 'pcm') return { pcm: await run.audio, stats: await run.stats }
+  if (collect === 'pcm') {
+    // Progress is drained alongside the audio rather than in a second fold:
+    // these tests ask whether one run produced audio *and* reported progress,
+    // and a second `collect` would be a second generation -- minutes of work
+    // answering a question about the first one.
+    const events = drain(run.progressStream)
+    const audio = (await run.audio) as {
+      pcm: unknown
+      sampleRate: unknown
+      channels: unknown
+      bitsPerSample: unknown
+    }
+    // Spelled out rather than passed through: Python's run hands back the same
+    // four values under `data`, so naming them here is what makes
+    // `$run.audio.pcm` one thing in both clients.
+    return {
+      audio: {
+        pcm: audio.pcm,
+        sampleRate: audio.sampleRate,
+        channels: audio.channels,
+        bitsPerSample: audio.bitsPerSample
+      },
+      stats: await run.stats,
+      events: await events
+    }
+  }
   if (collect === 'events') {
     const events = await drain(run.progressStream)
     await run.audio
@@ -350,6 +377,34 @@ function unsupported(method: string, collect: CollectMode): StepIncompleteError 
  * the same `kind`/`file` pair through Metro instead, and the definition would
  * not change.
  */
+/**
+ * A fixture the catalog names but no file holds: `"2s-440hz"` is two seconds of
+ * a 440 Hz tone.
+ *
+ * The audio tests feed a synthesized tone rather than a recording because the
+ * point is a known signal, not a performance. Generating it from the name
+ * keeps it a fixture both clients resolve identically -- checking in a wav
+ * would work too, but then "the same source audio" would rest on a binary
+ * nobody reads.
+ */
+const TONE = /^(\d+(?:\.\d+)?)s-(\d+(?:\.\d+)?)hz$/
+
+/** Raw interleaved stereo 48 kHz Float32 LE PCM, the form AudioGen accepts. */
+const synthesizeTone = (spec: string): Uint8Array => {
+  const match = TONE.exec(spec)
+  if (!match) throw new Error(`tone "${spec}" is not "<seconds>s-<frequency>hz"`)
+  const [seconds, frequency] = [Number(match[1]), Number(match[2])]
+  const frames = Math.round(AUDIOGEN_INPUT_SAMPLE_RATE * seconds)
+  const pcm = new Float32Array(frames * AUDIOGEN_INPUT_CHANNELS)
+  for (let frame = 0; frame < frames; frame++) {
+    const sample = 0.1 * Math.sin((2 * Math.PI * frequency * frame) / AUDIOGEN_INPUT_SAMPLE_RATE)
+    for (let channel = 0; channel < AUDIOGEN_INPUT_CHANNELS; channel++) {
+      pcm[frame * AUDIOGEN_INPUT_CHANNELS + channel] = sample
+    }
+  }
+  return new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength)
+}
+
 const ASSET_ROOTS: Record<string, string> = {
   image: 'assets/images',
   audio: 'assets/audio',
@@ -387,6 +442,24 @@ const ASSERTIONS: Record<
     const expected = Number(args.length)
     if (value.length !== expected) {
       return { passed: false, output: `expected ${expected} element(s), got ${value.length}` }
+    }
+    return { passed: true, output: `${value.length} element(s)` }
+  },
+
+  /**
+   * The collection has at least this many elements.
+   *
+   * The floor half of `lengthIs`: "the registry lists models" and "more than
+   * one result came back" are the same check with a different bound, and a
+   * test that pinned the exact count would fail whenever the registry grew.
+   */
+  lengthAtLeast(value, args) {
+    if (!Array.isArray(value)) {
+      return { passed: false, output: `expected an array, got ${typeof value}` }
+    }
+    const minimum = Number(args.length)
+    if (value.length < minimum) {
+      return { passed: false, output: `expected at least ${minimum}, got ${value.length}` }
     }
     return { passed: true, output: `${value.length} element(s)` }
   },
@@ -765,6 +838,10 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
     },
 
     async asset(kind, file, form) {
+      if (kind === 'tone') {
+        if (form === 'path') throw new Error('a synthesized tone has no path')
+        return synthesizeTone(file)
+      }
       const root = ASSET_ROOTS[kind]
       if (!root) {
         throw new StepIncompleteError(`asset kind "${kind}" is not known to these bindings`)
