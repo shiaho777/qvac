@@ -364,11 +364,23 @@ async def _transcribe(transport: Any, params: dict[str, Any]) -> Any:
     request = TranscribeRequest.model_validate(
         {"type": "transcribe", **{**params, "audioChunk": chunk}}
     )
-    response = await transcribe(transport, request)
-    envelope = response.model_dump() if hasattr(response, "model_dump") else response
-    if isinstance(envelope, dict) and envelope.get("success") is False:
-        raise reconstruct_error(envelope)
-    return response
+    # The generated stub yields chunks; JS folds them into the complete text,
+    # or into the segment list when `metadata` is set, and resolves one value.
+    # Awaiting the generator raised TypeError, so transcription never ran from
+    # Python -- the same fold has to live on this side of the wire.
+    want_segments = bool(params.get("metadata"))
+    segments: list[Any] = []
+    text = ""
+    async for response in transcribe(transport, request):
+        if getattr(response, "segment", None) is not None:
+            segments.append(_jsonable(response.segment))
+        if getattr(response, "text", None):
+            text += response.text
+        if getattr(response, "done", False):
+            break
+    # JS binds the value itself; the catalog projects `text` off it, and with
+    # `metadata` that field carries the segments -- the same shape both ways.
+    return {"text": segments if want_segments else text}
 
 
 async def _vector_index_dispose(transport: Any, params: dict[str, Any]) -> Any:
@@ -627,6 +639,13 @@ async def _completion_stream(
         tools=params.get("tools"),
         response_format=params.get("responseFormat"),
         tool_dialect=params.get("toolDialect"),
+        # `kv_cache` was missing, so every kv-cache test ran against this
+        # client with no cache at all -- and the ones that only check that text
+        # came back passed anyway. `cacheTokens` stayed zero, which is what
+        # finally showed it.
+        kv_cache=params.get("kvCache"),
+        capture_thinking=params.get("captureThinking"),
+        emit_raw_deltas=params.get("emitRawDeltas"),
     )
     if collect == "text":
         # `tool_calls` rides along with the text because a tools test needs
