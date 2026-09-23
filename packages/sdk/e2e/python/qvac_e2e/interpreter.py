@@ -56,7 +56,18 @@ from tetherto.qvac_sdk import (
     state,
     suspend,
     transcribe,
+    audio_edit,
+    audio_gen,
+    audio_understand,
+    batch_completion,
+    diffusion,
+    invoke_plugin_stream,
+    ocr,
+    text_to_speech,
+    transcribe_stream_run,
     translate,
+    upscale,
+    world_step,
     unload_model,
     vector_index,
     vla,
@@ -281,6 +292,221 @@ async def _translate_stream(
     return {"text": text}
 
 
+async def _ocr_stream(transport: Any, params: dict[str, Any], collect: str) -> Any:
+    run = ocr(
+        transport,
+        model_id=params["modelId"],
+        image=params["image"],
+        options=params.get("options"),
+    )
+    if collect == "blocks":
+        return {"blocks": _jsonable(await run.blocks)}
+    if collect == "all":
+        return {"all": _jsonable([block async for block in run.block_stream])}
+    if collect == "events":
+        return {"events": _jsonable([block async for block in run.block_stream])}
+    if collect == "text":
+        blocks = await run.blocks
+        return {"text": "\n".join(getattr(b, "text", "") or "" for b in blocks)}
+    raise StepError(f'collect: "{collect}" is not defined for ocr', incomplete=True)
+
+
+async def _transcribe_stream(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
+    run = transcribe_stream_run(
+        transport,
+        model_id=params["modelId"],
+        **{k: v for k, v in params.items() if k not in ("modelId",)},
+    )
+    pieces = await run.collected
+    if collect in ("blocks", "all"):
+        return {collect: _jsonable(pieces)}
+    if collect == "last":
+        return {"last": _jsonable(pieces[-1]) if pieces else None}
+    if collect == "text":
+        return {"text": "".join(str(p) for p in pieces)}
+    raise StepError(
+        f'collect: "{collect}" is not defined for transcribeStream', incomplete=True
+    )
+
+
+async def _tts_stream(transport: Any, params: dict[str, Any], collect: str) -> Any:
+    run = text_to_speech(
+        transport,
+        model_id=params["modelId"],
+        **{k: v for k, v in params.items() if k != "modelId"},
+    )
+    if collect == "pcm":
+        buffer = await run.buffer
+        return {
+            "pcm": buffer,
+            "sampleRate": await run.sample_rate,
+            "done": await run.done,
+        }
+    if collect == "all":
+        return {"all": [sample async for sample in run.buffer_stream]}
+    if collect == "events":
+        return {"events": [tick async for tick in run.progress_stream]}
+    raise StepError(
+        f'collect: "{collect}" is not defined for textToSpeech', incomplete=True
+    )
+
+
+async def _images_stream(run: Any, collect: str, method: str) -> Any:
+    """diffusion and upscale return the same run shape, so they fold alike."""
+    if collect == "events":
+        # Drain progress before awaiting the outputs: the generator is the live
+        # side of the same stream, and awaiting first would leave nothing to
+        # iterate.
+        events = [tick async for tick in run.progress_stream]
+        await run.outputs
+        return {"events": events}
+    if collect == "all":
+        return {"all": await run.outputs}
+    if collect == "last":
+        outputs = await run.outputs
+        return {"last": outputs[-1] if outputs else None}
+    raise StepError(
+        f'collect: "{collect}" is not defined for {method}', incomplete=True
+    )
+
+
+async def _diffusion_stream(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
+    run = diffusion(
+        transport,
+        model_id=params["modelId"],
+        **{k: v for k, v in params.items() if k != "modelId"},
+    )
+    return await _images_stream(run, collect, "diffusion")
+
+
+async def _upscale_stream(transport: Any, params: dict[str, Any], collect: str) -> Any:
+    run = upscale(
+        transport,
+        model_id=params["modelId"],
+        image=params["image"],
+        repeats=params.get("repeats"),
+    )
+    return await _images_stream(run, collect, "upscale")
+
+
+async def _audio_stream(run: Any, collect: str, method: str) -> Any:
+    if collect == "pcm":
+        audio = await run.audio
+        return {"pcm": audio["data"], "stats": _jsonable(await run.stats)}
+    if collect == "events":
+        events = [tick async for tick in run.progress_stream]
+        await run.audio
+        return {"events": events}
+    raise StepError(
+        f'collect: "{collect}" is not defined for {method}', incomplete=True
+    )
+
+
+async def _audio_gen_stream(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
+    run = audio_gen(
+        transport,
+        model_id=params["modelId"],
+        **{k: v for k, v in params.items() if k != "modelId"},
+    )
+    return await _audio_stream(run, collect, "audioGen")
+
+
+async def _audio_edit_stream(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
+    run = audio_edit(
+        transport,
+        model_id=params["modelId"],
+        operations=params["operations"],
+        **{k: v for k, v in params.items() if k not in ("modelId", "operations")},
+    )
+    return await _audio_stream(run, collect, "audioEdit")
+
+
+async def _audio_understand_stream(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
+    run = audio_understand(
+        transport,
+        model_id=params["modelId"],
+        **{k: v for k, v in params.items() if k != "modelId"},
+    )
+    if collect == "text":
+        return {"text": await run.description}
+    if collect == "events":
+        events = [tick async for tick in run.progress_stream]
+        await run.description
+        return {"events": events}
+    raise StepError(
+        f'collect: "{collect}" is not defined for audioUnderstand', incomplete=True
+    )
+
+
+async def _batch_completion_stream(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
+    run = batch_completion(
+        transport,
+        model_id=params["modelId"],
+        prompts=params["prompts"],
+        **{k: v for k, v in params.items() if k not in ("modelId", "prompts")},
+    )
+    if collect == "all":
+        return {"all": _jsonable(await run.results)}
+    if collect == "events":
+        return {"events": _jsonable([event async for event in run.events])}
+    raise StepError(
+        f'collect: "{collect}" is not defined for batchCompletion', incomplete=True
+    )
+
+
+async def _world_step_stream(
+    transport: Any, params: dict[str, Any], collect: str
+) -> Any:
+    run = world_step(transport, model_id=params["modelId"], keys=params.get("keys"))
+    if collect == "all":
+        return {"all": await run.frames}
+    if collect == "last":
+        frames = await run.frames
+        return {"last": frames[-1] if frames else None, "frameCount": len(frames)}
+    if collect == "events":
+        frames = await run.frames
+        return {
+            "events": [tick async for tick in run.progress_stream],
+            "frameCount": len(frames),
+        }
+    raise StepError(
+        f'collect: "{collect}" is not defined for worldStep', incomplete=True
+    )
+
+
+async def _plugin_stream(transport: Any, params: dict[str, Any], collect: str) -> Any:
+    chunks = [
+        chunk
+        async for chunk in invoke_plugin_stream(
+            transport,
+            model_id=params["modelId"],
+            handler=params["handler"],
+            params=params.get("params"),
+        )
+    ]
+    if collect == "all":
+        return {"all": _jsonable(chunks)}
+    if collect == "last":
+        return {"last": _jsonable(chunks[-1]) if chunks else None}
+    if collect == "text":
+        return {"text": "".join(str(c) for c in chunks)}
+    raise StepError(
+        f'collect: "{collect}" is not defined for invokePluginStream', incomplete=True
+    )
+
+
 # Methods whose result is a stream handle rather than a value. A step reaches
 # these through `collect`, which names the fold it wants.
 #
@@ -294,65 +520,29 @@ async def _translate_stream(
 STREAMS: dict[str, Callable[[Any, dict[str, Any], str], Any]] = {
     "completion": _completion_stream,
     "translate": _translate_stream,
+    "ocr": _ocr_stream,
+    "transcribeStream": _transcribe_stream,
+    "textToSpeech": _tts_stream,
+    "diffusion": _diffusion_stream,
+    "upscale": _upscale_stream,
+    "audioGen": _audio_gen_stream,
+    "audioEdit": _audio_edit_stream,
+    "audioUnderstand": _audio_understand_stream,
+    "batchCompletion": _batch_completion_stream,
+    "worldStep": _world_step_stream,
+    "invokePluginStream": _plugin_stream,
 }
 
-# Streaming methods where the Python SDK has only the generated stub.
+# Streaming methods the Python SDK still has no run handle for.
 #
 # This table is the client's own roadmap, and shrinking it is the number the
 # release claim is about. Each entry says what JS returns, because that is the
 # shape a definition written against the reference client assumes.
 NO_RUN_HANDLE: dict[str, str] = {
-    "ocr": (
-        "Python has only the generated ocr_stream stub, which yields raw wire "
-        "chunks; JS returns a run with blockStream/blocks/stats. Needs an "
-        "ergonomic wrapper before a definition written against the JS shape "
-        "can run here."
-    ),
-    "transcribeStream": (
-        "Python has transcribe_stream and transcribe_stream_session, neither "
-        "shaped like the JS generator of segments. Needs an ergonomic wrapper."
-    ),
-    "textToSpeech": (
-        "Python has only the generated text_to_speech_stream stub; JS returns "
-        "a run with bufferStream/buffer/done/sampleRate. Needs an ergonomic "
-        "wrapper."
-    ),
-    "diffusion": (
-        "Python has only the generated diffusion_stream stub; JS returns a run "
-        "with progressStream/outputs/stats. Needs an ergonomic wrapper."
-    ),
-    "upscale": (
-        "Python has only the generated upscale_stream stub; JS returns a run "
-        "with outputs/stats. Needs an ergonomic wrapper."
-    ),
-    "audioGen": (
-        "Python has only the generated audio_gen_stream stub; JS returns a run "
-        "with progressStream/audio/stats. Needs an ergonomic wrapper."
-    ),
-    "audioEdit": (
-        "Python has only the generated audio_edit_stream stub; JS returns a run "
-        "with progressStream/audio/stats. Needs an ergonomic wrapper."
-    ),
-    "audioUnderstand": (
-        "Python has only the generated audio_understand stub; JS returns a run "
-        "with progressStream/description/stats. Needs an ergonomic wrapper."
-    ),
-    "batchCompletion": (
-        "Python has only the generated batch_completion_stream stub; JS returns "
-        "a run with events/results. Needs an ergonomic wrapper."
-    ),
-    "worldStep": (
-        "Python has only the generated world_step_stream stub; JS returns a run "
-        "with frameStream/progressStream. Needs an ergonomic wrapper."
-    ),
     "finetune": (
         "Python's finetune is the generated reply stub; JS returns a handle "
         "with progressStream/result. Needs an ergonomic wrapper for the "
         "progress-bearing form."
-    ),
-    "invokePluginStream": (
-        "Python's invoke_plugin_stream yields decoded chunks but is not wired "
-        "into these bindings yet."
     ),
 }
 
