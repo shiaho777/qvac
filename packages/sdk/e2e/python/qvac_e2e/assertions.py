@@ -218,6 +218,25 @@ def timing_stats_present(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{field}={measured}")
 
 
+def produced_audio(value: Any, args: dict[str, Any]) -> StepResult:
+    """The run produced audio.
+
+    `minSamples` is the bar: 1 for a normal synthesis, 0 for the tests that
+    feed empty text and only care that the SDK handled it rather than crashing.
+    The executors asserted a synthesised sentence -- "generated N samples" --
+    against `type: string`, which every string satisfies, so they could not
+    fail whatever the engine did. This asks the question they meant.
+    """
+    if isinstance(value, (list, tuple, bytes, bytearray)):
+        samples = len(value)
+    else:
+        samples = 0
+    floor = int(args.get("minSamples", 1))
+    if samples < floor:
+        return StepResult.fail(f"expected at least {floor} sample(s), got {samples}")
+    return StepResult.ok(f"{samples} sample(s)")
+
+
 def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """`getLoadedModelInfo` returned a record describing the model we loaded.
 
@@ -263,5 +282,6 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "toolCallShape": tool_call_shape,
     "textBlockShape": text_block_shape,
     "timingStatsPresent": timing_stats_present,
+    "producedAudio": produced_audio,
     "loadedModelInfoShape": loaded_model_info_shape,
 }

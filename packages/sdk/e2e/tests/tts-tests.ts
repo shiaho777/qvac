@@ -1,4 +1,45 @@
-import type { TestDefinition } from '@qvac/test-suite'
+import type { Step, TestDefinition } from '@qvac/test-suite'
+
+/**
+ * One synthesis, checked for the audio it produced.
+ *
+ * The executors validated a sentence they had just written -- "generated N
+ * samples" -- against `type: string`. Every string satisfies that, so those
+ * tests passed whatever the engine did. The declarative body asks the question
+ * they meant: did audio come back. `minSamples: 0` is for the empty-text
+ * cases, which only care that the SDK handled it rather than crashing.
+ */
+const ttsSteps = (dependency: string, minSamples = 1): Step[] => [
+  { useModel: { deps: [dependency], as: 'model' } },
+  {
+    call: {
+      method: 'textToSpeech',
+      collect: 'pcm',
+      params: {
+        modelId: '$model',
+        text: '$params.text',
+        inputType: 'text',
+        stream: '$params.stream?',
+        sentenceStream: '$params.sentenceStream?'
+      },
+      as: 'run'
+    }
+  },
+  { project: { from: '$run', path: 'pcm', as: 'pcm' } },
+  { assert: { on: '$pcm', named: 'producedAudio', with: { minSamples } } }
+]
+
+/**
+ * Tests whose body compares two runs against each other -- a sample rate
+ * against another sample rate, an emotion against its neutral baseline. One
+ * call is not what they are about, so they keep their hand-written bodies.
+ */
+const TTS_COMPARISONS = new Set([
+  'tts-supertonic-output-sample-rate',
+  'tts-supertonic-enhanced',
+  'tts-parler-emotion-conditioning',
+  'tts-cosyvoice3-emotion-conditioning'
+])
 
 export const ttsChatterboxShortText: TestDefinition = {
   testId: 'tts-chatterbox-short-text',
@@ -433,3 +474,18 @@ export const ttsTests = [
   ttsAudio8SentenceStreaming,
   ttsAudio8DuplexStreaming
 ]
+
+/**
+ * Attach the declarative body to every definition that is one call.
+ *
+ * Done as a pass over the list rather than by editing thirty literals, on the
+ * same conditions the executor branched on: which model the test names, and
+ * whether its text is empty. Keeping the conditions in one place is what makes
+ * it checkable that the migration did not quietly change any of them.
+ */
+for (const test of ttsTests) {
+  if (TTS_COMPARISONS.has(test.testId)) continue
+  const { text } = test.params as { text?: string }
+  const isEmpty = !text || text.trim().length === 0
+  test.steps = ttsSteps(test.metadata?.dependency ?? 'tts-chatterbox', isEmpty ? 0 : 1)
+}

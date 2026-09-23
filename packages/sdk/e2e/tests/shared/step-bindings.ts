@@ -605,6 +605,28 @@ const ASSERTIONS: Record<
     return { passed: true, output: `${field}=${measured}` }
   },
 
+  /**
+   * The run produced audio.
+   *
+   * `minSamples` is the bar: 1 for a normal synthesis, 0 for the tests that
+   * feed empty text and only care that the SDK handled it rather than
+   * crashing. The executors asserted a synthesised sentence -- "generated N
+   * samples" -- against `type: string`, which every string satisfies, so they
+   * could not fail whatever the engine did. This asks the question they meant.
+   */
+  producedAudio(value, args) {
+    const samples = Array.isArray(value)
+      ? value.length
+      : ArrayBuffer.isView(value)
+        ? (value as unknown as { length: number }).length
+        : 0
+    const floor = Number(args.minSamples ?? 1)
+    if (samples < floor) {
+      return { passed: false, output: `expected at least ${floor} sample(s), got ${samples}` }
+    }
+    return { passed: true, output: `${samples} sample(s)` }
+  },
+
   loadedModelInfoShape(value, args) {
     const info = value as {
       modelId?: string
