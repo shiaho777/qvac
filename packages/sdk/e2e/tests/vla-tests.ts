@@ -1,5 +1,12 @@
 import type { Step, TestDefinition } from '@qvac/test-suite'
 
+// Six of these stay on their executors. They feed the model tensors the test
+// generates -- images of a given shape, a state vector, token ids, an
+// attention mask -- and a step can name data but not compute it, so the
+// vocabulary has no way to describe "a zero-filled Float32Array of
+// chunkSize × actionDim". The four `hparams` tests, which only read the loaded
+// model's shape back, are migrated.
+//
 // SmolVLA-LIBERO inference always returns a chunkSize × actionDim Float32Array
 // of robot actions plus per-stage timings. These tests exercise the SDK's
 // `vla()` / `vlaHparams()` client functions end-to-end against a registry-

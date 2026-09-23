@@ -1,3 +1,20 @@
+// Cancellation, and why this whole file stays on its executors.
+//
+// Every test here issues the cancel in a retry loop bounded by whether the
+// operation has settled: a cancel that beats the request's registration
+// matches nothing, so one well-timed attempt is a coin flip and the executors
+// re-issue until the op settles or a deadline passes. Two things make that
+// inexpressible as steps -- a loop whose condition is "has this promise
+// settled yet", and the request id of a call that is still in flight, which
+// `start` binds as an opaque handle rather than as data a step can name.
+//
+// `world-cancel-then-reload` is migrated and looks similar, but it is not: one
+// broad cancel against a warm session is enough there, so it needs no loop and
+// no id.
+//
+// These carry the `imperative` suite tag, like the `no-lingering-bare-*`
+// tests: each client writes its own body, and the catalog says which tests
+// those are.
 import type { TestDefinition } from '@qvac/test-suite'
 
 export const cancelMidStreamCompletion: TestDefinition = {

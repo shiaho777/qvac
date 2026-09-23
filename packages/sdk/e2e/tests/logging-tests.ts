@@ -394,6 +394,50 @@ export const loggingConcurrentOperations: TestDefinition = {
   testId: 'logging-concurrent-operations',
   params: { handler: 'concurrent', operations: ['completion', 'embedding'], runConcurrently: true },
   expectation: { validation: 'type', expectedType: 'string' },
+  // Two operations in flight against two different addons. `start` is what
+  // makes it the concurrent test its name claims: the executor fired both with
+  // `Promise.allSettled`, and running them one after another would prove
+  // nothing about the log stream under load.
+  steps: [
+    ...logsAround(
+      { id: '$model' },
+      [
+        {
+          start: {
+            method: 'completion',
+            collect: 'text',
+            params: {
+              modelId: '$model',
+              history: [{ role: 'user', content: 'Test concurrent logging' }],
+              stream: false,
+              generationParams: { predict: 20 }
+            },
+            as: 'completing'
+          }
+        },
+        {
+          start: {
+            method: 'embed',
+            params: { modelId: '$embeddingModel', text: 'test concurrent' },
+            as: 'embedding'
+          }
+        },
+        { settle: { of: '$completing', as: 'completed' } },
+        { settle: { of: '$embedding', as: 'embedded' } }
+      ],
+      {
+        target: 5,
+        timeoutMs: 10000,
+        before: [
+          { useModel: { deps: ['llm', 'embeddings'], as: 'models' } },
+          { project: { from: '$models', path: '[0]', as: 'model' } },
+          { project: { from: '$models', path: '[1]', as: 'embeddingModel' } }
+        ]
+      }
+    ),
+    { assert: { on: '$entries', named: 'lengthAtLeast', with: { length: 1 } } }
+  ],
+  finally: closeLogStream,
   metadata: { category: 'logging', dependency: 'llm', estimatedDurationMs: 15000 }
 }
 
@@ -401,6 +445,22 @@ export const loggingPersistAcrossReload: TestDefinition = {
   testId: 'logging-persist-across-reload',
   params: { handler: 'reload', setLogLevel: 'debug', unloadModel: true, reloadModel: true },
   expectation: { validation: 'type', expectedType: 'string' },
+  // The stream is opened on the model that exists *after* the reload, which
+  // is the whole point: logs have to keep flowing from a freshly loaded model,
+  // not only from the one that was up when the process started.
+  steps: [
+    ...logsAround({ id: '$model' }, completionTrigger, {
+      target: 5,
+      timeoutMs: 10000,
+      before: [
+        { useModel: { deps: ['llm'], as: 'original' } },
+        { call: { method: 'evictResource', params: { dep: 'llm' } } },
+        { useModel: { deps: ['llm'], as: 'model' } }
+      ]
+    }),
+    { assert: { on: '$entries', named: 'lengthAtLeast', with: { length: 1 } } }
+  ],
+  finally: closeLogStream,
   metadata: { category: 'logging', dependency: 'llm', estimatedDurationMs: 15000 }
 }
 
