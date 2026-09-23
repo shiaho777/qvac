@@ -18,7 +18,7 @@ import type { TestDefinition } from '../types/test-definition.js'
  *
  *   client  -> framework  { "type": "ready", "protocol": 1 }
  *   framework -> client   { "type": "execute", "testId", "params",
- *                           "expectation", "metadata", "steps" }
+ *                           "expectation", "metadata", "steps", "finally" }
  *   client  -> framework  { "type": "log", "message" }            (zero or more)
  *   client  -> framework  { "type": "result", "passed", "output",
  *                           "skipped"?, "incomplete"?, "reason"?,
@@ -296,7 +296,8 @@ export class BridgeExecutor implements TestExecutor {
       params,
       expectation,
       metadata: context,
-      steps: definition.steps
+      steps: definition.steps,
+      ...(definition.finally?.length ? { finally: definition.finally } : {})
     })
 
     if (response.incomplete) {

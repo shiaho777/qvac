@@ -90,6 +90,26 @@ class StepError extends Error {
 
 const INDEXED = /^(.*?)\[(\d+)\]$/
 
+/**
+ * A call `start` began and `settle` has yet to await.
+ *
+ * Held under a symbol so a started call cannot be mistaken for data: every
+ * other binding in scope is a value the test may project or assert on, and a
+ * promise that answered `project` would silently assert on a Promise object.
+ */
+const PENDING = Symbol('pending')
+
+/** The outcome of a started call, captured so awaiting it twice is safe. */
+type Outcome = { value: unknown } | { error: unknown }
+
+type Pending = { [PENDING]: Promise<Outcome> }
+
+const isPending = (value: unknown): value is Pending =>
+  typeof value === 'object' && value !== null && PENDING in value
+
+/** Where the run collects started calls, so none outlive the test. */
+const STARTED = '__started'
+
 export class StepInterpreter {
   private readonly bindings: StepBindings
 
@@ -112,7 +132,9 @@ export class StepInterpreter {
     // the order tests happened to arrive in.
     if (this.bindings.evictAllExcept) {
       const declared = new Set<string>()
-      for (const step of steps) {
+      // Teardown counts as declaration: a test that unloads its model in
+      // `finally` must not have it evicted out from under the body.
+      for (const step of [...steps, ...(definition.finally ?? [])]) {
         if ('useModel' in step) for (const dep of step.useModel.deps) declared.add(dep)
       }
       await this.bindings.evictAllExcept(declared)
@@ -120,6 +142,17 @@ export class StepInterpreter {
 
     const scope: Record<string, unknown> = { params: definition.params ?? {} }
 
+    const body = await this.runBody(steps, scope, definition)
+    const teardown = await this.runTeardown(definition, scope)
+    await this.drainStarted(scope)
+    return teardown ? this.merge(body, teardown) : body
+  }
+
+  private async runBody(
+    steps: Step[],
+    scope: Record<string, unknown>,
+    definition: TestDefinition
+  ): Promise<TestResult> {
     try {
       const asserted = await this.runSteps(steps, scope, definition.expectation)
       if (!asserted) {
@@ -127,27 +160,99 @@ export class StepInterpreter {
       }
       return asserted
     } catch (error: unknown) {
-      if (error instanceof StepIncompleteError) {
-        return {
-          passed: false,
-          incomplete: true,
-          incompleteReason: error.message,
-          output: error.message
-        }
-      }
-      if (error instanceof StepError) {
-        return error.incomplete
-          ? {
-              passed: false,
-              incomplete: true,
-              incompleteReason: error.message,
-              output: error.message
-            }
-          : { passed: false, output: error.message }
-      }
-      const message = error instanceof Error ? error.message : String(error)
-      return { passed: false, output: message }
+      return this.asResult(error)
     }
+  }
+
+  /**
+   * Runs the teardown steps, if any. Returns the failure, or `undefined` when
+   * teardown is absent or clean -- a clean teardown has nothing to say about
+   * the test.
+   *
+   * Teardown runs on both paths, so a body that fails halfway still restores
+   * the client. It shares the body scope: teardown usually needs what the body
+   * bound, and a binding the body never reached is referenced optionally.
+   */
+  private async runTeardown(
+    definition: TestDefinition,
+    scope: Record<string, unknown>
+  ): Promise<TestResult | undefined> {
+    const steps = definition.finally ?? []
+    if (steps.length === 0) return undefined
+    let result: TestResult | undefined
+    try {
+      result = await this.runSteps(steps, scope, definition.expectation)
+    } catch (error: unknown) {
+      result = this.asResult(error)
+    }
+    return result && !result.passed ? result : undefined
+  }
+
+  /**
+   * Folds a failed teardown into the body's result.
+   *
+   * A body that passed cannot be claimed on a client that could not clean up
+   * after it, so the teardown's verdict stands. A body that already failed
+   * keeps its own message -- that is the diagnosis -- and carries the teardown
+   * failure alongside it, the way the imperative executors appended
+   * "recovery also failed".
+   */
+  private merge(body: TestResult, teardown: TestResult): TestResult {
+    if (body.passed) return teardown
+    return {
+      ...body,
+      output: `${body.output} [teardown also failed: ${teardown.output}]`
+    }
+  }
+
+  /**
+   * The run's list of started calls. Lives in the scope so the copy `repeat`
+   * makes for each iteration shares the same array -- a call started inside a
+   * loop is still the run's responsibility.
+   */
+  private started(scope: Record<string, unknown>): Pending[] {
+    const existing = scope[STARTED]
+    if (Array.isArray(existing)) return existing as Pending[]
+    const list: Pending[] = []
+    scope[STARTED] = list
+    return list
+  }
+
+  /**
+   * Waits for every started call the test never settled.
+   *
+   * An in-flight completion that outlives its test goes on holding the model
+   * while the next test loads its own, and lands its result in the middle of
+   * somebody else's run. Nothing here is reported: a call the test never
+   * settled made no claim.
+   */
+  private async drainStarted(scope: Record<string, unknown>): Promise<void> {
+    const list = scope[STARTED]
+    if (!Array.isArray(list)) return
+    await Promise.all((list as Pending[]).map((pending) => pending[PENDING]))
+  }
+
+  private asResult(error: unknown): TestResult {
+    if (error instanceof StepIncompleteError) {
+      return {
+        passed: false,
+        incomplete: true,
+        incompleteReason: error.message,
+        output: error.message
+      }
+    }
+    if (error instanceof StepError) {
+      return error.incomplete
+        ? {
+            passed: false,
+            incomplete: true,
+            incompleteReason: error.message,
+            output: error.message
+          }
+        : { passed: false, output: error.message }
+    }
+    const message = error instanceof Error ? error.message : String(error)
+    return { passed: false, output: message }
   }
 
   private async runSteps(
@@ -215,6 +320,36 @@ export class StepInterpreter {
       const params = this.callParams(step.call.params, scope)
       const value = await this.bindings.call(step.call.method, params, step.call.collect)
       scope[step.call.as ?? 'result'] = value
+      return undefined
+    }
+
+    if ('start' in step) {
+      const params = this.callParams(step.start.params, scope)
+      // Settled into an outcome record immediately. A started call that is
+      // never settled, or one whose test fails before `settle`, would
+      // otherwise reject with nobody listening -- an unhandled rejection that
+      // takes the consumer process down for a test it was not even about.
+      const pending: Pending = {
+        [PENDING]: Promise.resolve(
+          this.bindings.call(step.start.method, params, step.start.collect)
+        ).then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error })
+        )
+      }
+      scope[step.start.as] = pending
+      this.started(scope).push(pending)
+      return undefined
+    }
+
+    if ('settle' in step) {
+      const handle = this.resolve(step.settle.of, scope)
+      if (!isPending(handle)) {
+        throw new StepError(`settle: "${step.settle.of}" is not a started call`)
+      }
+      const outcome = await handle[PENDING]
+      if ('error' in outcome) throw outcome.error
+      scope[step.settle.as ?? 'result'] = outcome.value
       return undefined
     }
 
@@ -336,6 +471,9 @@ export class StepInterpreter {
       const step = steps[i]
       if ('project' in step) return step.project.as
       if ('call' in step) return step.call.as ?? 'result'
+      // `settle` binds a value; `start` binds an in-flight call, which is not
+      // something a loop can collect.
+      if ('settle' in step) return step.settle.as ?? 'result'
       if ('asset' in step) return step.asset.as
       if ('modelSource' in step) return step.modelSource.as
     }

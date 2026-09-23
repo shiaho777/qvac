@@ -107,6 +107,28 @@ export const stepSchema: z.ZodType<Step> = z.lazy(() =>
 
     z
       .object({
+        start: z.object({
+          method: z.string().describe('SDK method name as it appears in the contract manifest'),
+          params: z.record(z.any()).optional().describe('Call parameters; values may use $refs'),
+          collect: collectModeSchema.optional().describe('How to fold a streaming result'),
+          as: z
+            .string()
+            .describe('Bind the in-flight call under this name, to be awaited by `settle`')
+        })
+      })
+      .strict(),
+
+    z
+      .object({
+        settle: z.object({
+          of: z.string().describe('Reference to a call started by `start`, e.g. "$inflight"'),
+          as: z.string().optional().describe('Bind the resolved value under this name')
+        })
+      })
+      .strict(),
+
+    z
+      .object({
         callError: z.object({
           method: z.string(),
           params: z.record(z.any()).optional(),
@@ -199,6 +221,15 @@ export type Step =
         as: string
       }
     }
+  | {
+      start: {
+        method: string
+        params?: Record<string, unknown>
+        collect?: CollectMode
+        as: string
+      }
+    }
+  | { settle: { of: string; as?: string } }
   | { repeat: { over: string; as: string; collectInto: string; steps: Step[] } }
   | { project: { from: string; path: string; join?: string; as: string } }
   | {
@@ -258,6 +289,17 @@ export const testDefinitionSchema = z.object({
       'Optional declarative test body. When present, a step interpreter executes the test and ' +
         'any language can run it. When absent the definition routes to its TypeScript executor ' +
         'exactly as before, so migration is per-test and reversible.'
+    ),
+
+  finally: z
+    .array(stepSchema)
+    .optional()
+    .describe(
+      'Teardown steps, run after the body whether it passed or failed. This is where the ' +
+        'imperative executors put their `finally` block: restore the runtime to active, delete ' +
+        'the workspace, unload the model. A body that fails halfway must not leave the client ' +
+        'poisoned for every test after it. Teardown reads the body scope, so bindings the body ' +
+        'may not have reached must be referenced optionally (`$id?`).'
     ),
 
   retryOnFailure: z

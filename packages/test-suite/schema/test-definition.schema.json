@@ -25,6 +25,14 @@
       },
       "description": "Declarative test body. A definition without `steps` routes to its TypeScript executor unchanged, so migration is per-test and reversible."
     },
+    "finally": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "description": "Teardown steps, run after the body whether it passed or failed. This is where the imperative executors put their `finally` block: restore the runtime to active, delete the workspace, unload the model. Teardown reads the body scope, so bindings the body may not have reached must be referenced optionally (`$id?`)."
+    },
     "suites": {
       "type": "array",
       "items": {
@@ -189,6 +197,12 @@
           "required": ["call"]
         },
         {
+          "required": ["start"]
+        },
+        {
+          "required": ["settle"]
+        },
+        {
           "required": ["callError"]
         },
         {
@@ -273,6 +287,41 @@
             },
             "collect": {
               "$ref": "#/$defs/collect"
+            }
+          }
+        },
+        "start": {
+          "type": "object",
+          "required": ["method", "as"],
+          "additionalProperties": false,
+          "description": "Begins a call without waiting for it, binding the in-flight call under `as`. The concurrency the imperative executors express by not awaiting: suspend while a completion is in flight, cancel a running download, race two loads. `settle` awaits it; a started call the test never settles is drained at the end of the run so it cannot land inside the next test.",
+          "properties": {
+            "method": {
+              "type": "string"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "collect": {
+              "$ref": "#/$defs/collect"
+            },
+            "as": {
+              "type": "string"
+            }
+          }
+        },
+        "settle": {
+          "type": "object",
+          "required": ["of"],
+          "additionalProperties": false,
+          "description": "Waits for a call begun by `start`. A rejection fails the step exactly as it would have on `call`.",
+          "properties": {
+            "of": {
+              "type": "string"
+            },
+            "as": {
+              "type": "string"
             }
           }
         },
