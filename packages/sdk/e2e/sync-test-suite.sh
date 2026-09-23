@@ -17,4 +17,11 @@ rm -rf "$dest/dist" "$dest/schema"
 cp -R "$src/dist" "$dest/dist"
 cp -R "$src/schema" "$dest/schema"
 cp "$src/package.json" "$dest/package.json"
+
+# The copy loses the executable bit, and `npx qvac-test` resolves through a
+# symlink to this file -- without it every local command has to be spelled
+# `node .../dist/cli/index.js`, which is the kind of papercut people work
+# around instead of reporting.
+chmod +x "$dest/dist/cli/index.js"
+
 echo "synced @qvac/test-suite from $src"
