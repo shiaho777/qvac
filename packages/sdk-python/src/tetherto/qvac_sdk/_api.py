@@ -141,9 +141,9 @@ async def load_model(
 
     resolved_type = model_type
     if not is_reload_config:
-        if resolved_type is not None:
+        if resolved_type is not None and model_src is not None:
             assert_model_src_matches_model_type(model_src, resolved_type)
-        else:
+        elif resolved_type is None:
             resolved_type = infer_model_type_from_model_src(model_src)
             if not resolved_type:
                 raise ModelTypeRequiredError()
@@ -164,7 +164,12 @@ async def load_model(
         if model_type is not None:
             payload["modelType"] = model_type
     else:
-        payload["modelSrc"] = model_src_to_wire(model_src)
+        # An addon that ships its own weights is loaded by type alone. JS omits
+        # `modelSrc` entirely in that case; sending it as null fails the
+        # request union, which is why a bundled classifier could not be loaded
+        # from Python at all.
+        if model_src is not None:
+            payload["modelSrc"] = model_src_to_wire(model_src)
         payload["modelType"] = resolved_type
         payload["requestId"] = (
             request_id if request_id is not None else generate_client_request_id()

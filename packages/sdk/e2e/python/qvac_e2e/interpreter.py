@@ -14,6 +14,7 @@ the JS client; bypassing it would prove only that the worker works.
 from __future__ import annotations
 
 import asyncio
+import base64
 import math
 import re
 import sys
@@ -81,6 +82,8 @@ from tetherto.qvac_sdk import (
     vla_hparams,
     vla_set_embodiment,
 )
+
+from tetherto.qvac_sdk.model_types import model_src_to_wire
 
 from .assertions import ASSERTIONS, COMPARISONS
 from .resources import ASSET_ROOT, ResourceManager, UnknownResourceError
@@ -279,6 +282,116 @@ async def _transcribe_stream_drain(
     return {"events": events, "stats": _jsonable(session.stats)}
 
 
+async def _invoke_plugin(transport: Any, params: dict[str, Any]) -> Any:
+    """A plugin call, bound the way JS binds it.
+
+    JS wraps the handler's return value as `{ result }` so a later step has a
+    field to project; Python returned it bare, so `$run.result.message`
+    resolved against nothing.
+    """
+    return {
+        "result": _jsonable(
+            await invoke_plugin(
+                transport,
+                model_id=params["modelId"],
+                handler=params["handler"],
+                params=params.get("params"),
+            )
+        )
+    }
+
+
+async def _get_model_info(transport: Any, params: dict[str, Any]) -> Any:
+    """Registry info about a model, unwrapped the way JS returns it.
+
+    Python's generated stub hands back the `{type, modelInfo}` envelope while
+    JS returns the record itself, so a body reading `isCached` found nothing.
+    """
+    request = GetModelInfoRequest.model_validate({"type": "getModelInfo", **params})
+    response = await get_model_info(transport, request)
+    return _jsonable(response.model_info)
+
+
+async def _vla_hparams(transport: Any, params: dict[str, Any]) -> Any:
+    """The loaded VLA model's hyperparameters, named the way JS names them.
+
+    Python returns a `(hparams, backend_name)` tuple; JS returns a record, and
+    a catalog body projects `hparams` out of it.
+    """
+    hparams, backend_name = await vla_hparams(transport, model_id=params["modelId"])
+    return {"hparams": _jsonable(hparams), "backendName": backend_name}
+
+
+async def _download_asset(transport: Any, params: dict[str, Any]) -> Any:
+    """Fetch an asset, taking a model constant the way the JS client does.
+
+    `assetSrc` arrives as the descriptor the resource table resolved; the wire
+    wants its `src` string, which is the same normalisation `load_model` does
+    for `modelSrc`. JS binds `{ path }`, so this does too.
+    """
+    asset_src = params.get("assetSrc")
+    request = DownloadAssetRequest.model_validate(
+        {
+            "type": "downloadAsset",
+            **{**params, "assetSrc": model_src_to_wire(asset_src)},
+        }
+    )
+    response = await download_asset(transport, request)
+    envelope = response.model_dump(mode="json", by_alias=True)
+    if envelope.get("success") is False:
+        raise reconstruct_error(envelope)
+    return {"path": envelope.get("assetId")}
+
+
+async def _transcribe(transport: Any, params: dict[str, Any]) -> Any:
+    """Transcribe, taking a file path or bytes the way the JS client does.
+
+    The wire's `audioChunk` is a tagged union -- `{type: "filePath"}` or
+    `{type: "base64"}` -- and JS normalises into it inside its own API layer
+    (`buildTranscribeRequest`). Python's generated stub takes the union
+    directly, so a catalog step that resolves an asset to a path handed it a
+    bare string and the request failed validation before reaching the worker.
+
+    Normalising here rather than in the generated module, which is generated;
+    the asymmetry is worth closing with an ergonomic wrapper in the Python SDK,
+    the way `_streams._image` already does for diffusion.
+    """
+    chunk = params.get("audioChunk")
+    if isinstance(chunk, str):
+        chunk = {"type": "filePath", "value": chunk}
+    elif isinstance(chunk, (bytes, bytearray, memoryview)):
+        chunk = {"type": "base64", "value": base64.b64encode(bytes(chunk)).decode()}
+    request = TranscribeRequest.model_validate(
+        {"type": "transcribe", **{**params, "audioChunk": chunk}}
+    )
+    response = await transcribe(transport, request)
+    envelope = response.model_dump() if hasattr(response, "model_dump") else response
+    if isinstance(envelope, dict) and envelope.get("success") is False:
+        raise reconstruct_error(envelope)
+    return response
+
+
+async def _vector_index_dispose(transport: Any, params: dict[str, Any]) -> Any:
+    """Close an index, tolerating one that was never opened.
+
+    Teardown runs on the failure path too, and a body that failed before
+    creating an index leaves `$indexId?` resolving to nothing -- the request
+    would then fail validation and report a teardown failure for a test whose
+    real problem was somewhere else. JS's binding guards the same way.
+    """
+    index_id = params.get("indexId")
+    if not index_id:
+        return {"disposed": False}
+    request = VectorIndexRequest.model_validate(
+        {"type": "vectorIndex", "operation": "dispose", "indexId": index_id}
+    )
+    response = await vector_index(transport, request)
+    envelope = response.model_dump(mode="json", by_alias=True)
+    if envelope.get("success") is False:
+        raise reconstruct_error(envelope)
+    return {"disposed": True}
+
+
 async def _vector_index_search(transport: Any, params: dict[str, Any]) -> Any:
     """One query against an index, folded the way JS folds it.
 
@@ -347,12 +460,10 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     # --- inference, request/reply -------------------------------------------
     "embed": _request(EmbedRequest, "embed", embed),
     "classify": _request(ClassifyRequest, "classify", classify),
-    "transcribe": _request(TranscribeRequest, "transcribe", transcribe),
+    "transcribe": _transcribe,
     "bciTranscribe": _request(BciTranscribeRequest, "bciTranscribe", bci_transcribe),
     "vla": lambda transport, params: vla(transport, **_snake(params)),
-    "vlaHparams": lambda transport, params: vla_hparams(
-        transport, model_id=params["modelId"]
-    ),
+    "vlaHparams": _vla_hparams,
     "vlaSetEmbodiment": lambda transport, params: vla_set_embodiment(
         transport, model_id=params["modelId"], embodiment=params["embodiment"]
     ),
@@ -361,7 +472,7 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "unloadModel": lambda transport, params: unload_model(
         transport, model_id=params["modelId"]
     ),
-    "getModelInfo": _request(GetModelInfoRequest, "getModelInfo", get_model_info),
+    "getModelInfo": _get_model_info,
     "getLoadedModelInfo": _request(
         GetLoadedModelInfoRequest, "getLoadedModelInfo", get_loaded_model_info
     ),
@@ -396,7 +507,7 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
         kv_cache_key=params.get("kvCacheKey"),
         model_id=params.get("modelId"),
     ),
-    "downloadAsset": _request(DownloadAssetRequest, "downloadAsset", download_asset),
+    "downloadAsset": _download_asset,
     "getSystemResources": _request(
         GetSystemResourcesRequest, "getSystemResources", get_system_resources
     ),
@@ -430,9 +541,7 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "vectorIndexWrite": _request(
         VectorIndexRequest, "vectorIndex", vector_index, operation="write"
     ),
-    "vectorIndexDispose": _request(
-        VectorIndexRequest, "vectorIndex", vector_index, operation="dispose"
-    ),
+    "vectorIndexDispose": _vector_index_dispose,
     "vectorIndexSearch": _vector_index_search,
     # --- transcription sessions ---------------------------------------------
     #
@@ -453,12 +562,9 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     # the manager handing out an id the worker no longer knows.
     "finetune": _request(FinetuneRequest, "finetune", finetune),
     # --- plugins -------------------------------------------------------------
-    "invokePlugin": lambda transport, params: invoke_plugin(
-        transport,
-        model_id=params["modelId"],
-        handler=params["handler"],
-        params=params.get("params"),
-    ),
+    # JS binds `{ result }` so a later step has a field to project; matching
+    # that here keeps one definition working on both clients.
+    "invokePlugin": _invoke_plugin,
 }
 
 

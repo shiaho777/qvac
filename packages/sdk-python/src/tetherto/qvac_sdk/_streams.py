@@ -195,6 +195,22 @@ def _decode(data: str | None) -> bytes:
     return base64.b64decode(data) if data else b""
 
 
+async def _closed_upstream() -> AsyncIterator[bytes]:
+    """An upstream with nothing in it, for a duplex call that sends no input."""
+    return
+    yield b""  # pragma: no cover - makes this an (empty) async generator
+
+
+def _base64(value: Any) -> Any:
+    """Raw base64, for the endpoints that take the bytes without a tag."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(value)).decode()
+    if isinstance(value, str):
+        with open(value, "rb") as handle:
+            return base64.b64encode(handle.read()).decode()
+    return value
+
+
 def _image(value: Any) -> Any:
     """Normalise an image argument the way JS's `ocr()`/`upscale()` do.
 
@@ -347,7 +363,11 @@ def upscale(
             None,
             type="upscaleStream",
             modelId=model_id,
-            image=_image(image),
+            # `upscale` takes bare base64, not the tagged union the OCR and
+            # diffusion endpoints take -- JS calls `encodeBase64` here rather
+            # than its image normaliser. Passing the union failed validation
+            # before the request left the process.
+            image=_base64(image),
             repeats=repeats,
         )
     )
@@ -410,7 +430,18 @@ def text_to_speech(
             run.sample_rate.set_result(chunk.sample_rate)
         return chunk.buffer or ()
 
-    _pump(run, transport, request, _methods.text_to_speech_stream, items_of=samples)
+    # `text_to_speech_stream` is the duplex stub and wants an upstream. Plain
+    # synthesis carries its text in the request, so the upstream is closed
+    # immediately -- without it the call raised TypeError before any audio was
+    # asked for, which meant non-session TTS did not work from Python at all.
+    # The interactive form is `sessions.text_to_speech_stream_session`.
+    _pump(
+        run,
+        transport,
+        request,
+        lambda t, r: _methods.text_to_speech_stream(t, r, _closed_upstream()),
+        items_of=samples,
+    )
     # The rate may never arrive on a failed or empty run; settle it with the
     # rest rather than leaving a caller awaiting it for ever.
     run.done.add_done_callback(
