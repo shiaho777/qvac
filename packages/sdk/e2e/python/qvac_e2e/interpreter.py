@@ -652,7 +652,16 @@ async def _tts_stream(transport: Any, params: dict[str, Any], collect: str) -> A
         **{k: v for k, v in params.items() if k != "modelId"},
     )
     if collect == "pcm":
-        buffer = await run.buffer
+        # The fold has to follow the mode. In streaming mode the run starts
+        # lazily -- nothing is sent until the buffer stream is iterated -- so
+        # awaiting `buffer` first leaves `sample_rate` and `done` pending for
+        # ever and the test dies on its timeout rather than failing. The
+        # non-streaming mode is the mirror image: there the stream is empty and
+        # `buffer` is where the audio is. Mirrors the JS fold.
+        if params.get("stream") is False:
+            buffer = await run.buffer
+        else:
+            buffer = [sample async for sample in run.buffer_stream]
         return {
             "pcm": buffer,
             "sampleRate": await run.sample_rate,

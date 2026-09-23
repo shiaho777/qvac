@@ -414,9 +414,16 @@ const STREAMS: Record<string, Fold> = {
   },
 
   textToSpeech: async (params, collect) => {
+    const p = params as unknown as { stream?: boolean }
     const run = textToSpeech(params)
     if (collect === 'pcm') {
-      const pcm = await run.buffer
+      // The fold has to follow the mode. In streaming mode the run starts
+      // lazily -- nothing is sent until `bufferStream` is iterated -- so
+      // awaiting `buffer` first leaves `sampleRate` and `done` pending for
+      // ever and the test dies on its timeout rather than failing. The
+      // non-streaming mode is the mirror image: there `bufferStream` is empty
+      // and `buffer` is where the audio is.
+      const pcm = p.stream === false ? await run.buffer : await drain(run.bufferStream)
       return { pcm, sampleRate: await run.sampleRate, done: await run.done }
     }
     if (collect === 'all') return { all: await drain(run.bufferStream) }
