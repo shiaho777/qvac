@@ -97,8 +97,16 @@ from .validation import validate
 #
 # Deliberately explicit rather than reflective: a typo in a step should be an
 # `incomplete` with a clear reason, not an attribute error deep in a stream.
-def _request(model: Any, method: str, call: Callable[..., Any]) -> Callable[..., Any]:
+def _request(
+    model: Any, method: str, call: Callable[..., Any], **fixed: Any
+) -> Callable[..., Any]:
     """Wrap a generated stub that takes a validated request model.
+
+    `fixed` names the discriminator a request union needs but the catalog step
+    does not carry -- `rag` is one wire method with nine operations, and the JS
+    client picks the branch by which function the test called. Leaving it to
+    the validator to guess would let a `deleteWorkspace` parse as some other
+    member that happens to accept the same field.
 
     A generated stub hands back the wire envelope as it arrived, so a rejected
     call shows up as `success: false` rather than as an exception. Turning that
@@ -111,7 +119,7 @@ def _request(model: Any, method: str, call: Callable[..., Any]) -> Callable[...,
 
     async def invoke(transport: Any, params: dict[str, Any]) -> Any:
         response = await call(
-            transport, model.model_validate({"type": method, **params})
+            transport, model.model_validate({"type": method, **fixed, **params})
         )
         envelope = (
             response.model_dump() if hasattr(response, "model_dump") else response
@@ -191,10 +199,19 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "resume": _request(ResumeRequest, "resume", resume),
     "state": _request(StateRequest, "state", state),
     # --- rag, vector index, finetune -----------------------------------------
-    "ragIngest": _request(RagRequest, "rag", rag),
-    "ragDeleteWorkspace": _request(RagRequest, "rag", rag),
-    "createVectorIndex": _request(VectorIndexRequest, "vectorIndex", vector_index),
-    "loadVectorIndex": _request(VectorIndexRequest, "vectorIndex", vector_index),
+    "ragIngest": _request(RagRequest, "rag", rag, operation="ingest"),
+    "ragCloseWorkspace": _request(
+        RagRequest, "rag", rag, operation="closeWorkspace"
+    ),
+    "ragDeleteWorkspace": _request(
+        RagRequest, "rag", rag, operation="deleteWorkspace"
+    ),
+    "createVectorIndex": _request(
+        VectorIndexRequest, "vectorIndex", vector_index, operation="create"
+    ),
+    "loadVectorIndex": _request(
+        VectorIndexRequest, "vectorIndex", vector_index, operation="load"
+    ),
     "finetune": _request(FinetuneRequest, "finetune", finetune),
     # --- plugins -------------------------------------------------------------
     "invokePlugin": lambda transport, params: invoke_plugin(
@@ -971,9 +988,13 @@ class Interpreter:
         if not absolute.exists():
             # A missing fixture is a real failure, not a client gap.
             raise StepError(f"asset not found: {absolute}")
-        scope[body["as"]] = (
-            str(absolute) if body.get("form") == "path" else absolute.read_bytes()
-        )
+        form = body.get("form")
+        if form == "path":
+            scope[body["as"]] = str(absolute)
+        elif form == "text":
+            scope[body["as"]] = absolute.read_text(encoding="utf-8")
+        else:
+            scope[body["as"]] = absolute.read_bytes()
         return None
 
     def _model_source(self, body: dict[str, Any], scope: dict[str, Any]) -> None:

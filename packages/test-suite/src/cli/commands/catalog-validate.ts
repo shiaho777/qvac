@@ -3,7 +3,11 @@ import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadConfig } from '../../utils/config-loader.js'
 import { loadTests } from '../../utils/test-loader.js'
-import { testDefinitionSchema, zodStepOperations } from '../../types/test-definition.js'
+import {
+  testDefinitionSchema,
+  zodStepFields,
+  zodStepOperations
+} from '../../types/test-definition.js'
 import type { Step } from '../../types/test-definition.js'
 
 /**
@@ -41,10 +45,32 @@ function schemaPath(): string {
  * describing the old vocabulary — so a non-JS client generates the wrong stubs.
  */
 export function schemaStepOperations(): string[] {
+  return Object.keys(publishedStep()).sort()
+}
+
+function publishedStep(): Record<string, { properties?: Record<string, unknown> }> {
   const schema = JSON.parse(fs.readFileSync(schemaPath(), 'utf-8')) as {
-    $defs: { step: { properties: Record<string, unknown> } }
+    $defs: { step: { properties: Record<string, { properties?: Record<string, unknown> }> } }
   }
-  return Object.keys(schema.$defs.step.properties).sort()
+  return schema.$defs.step.properties
+}
+
+/**
+ * The fields the JSON Schema declares, `operation.field`.
+ *
+ * The name-level comparison missed `asset.form`: it reached Zod, both
+ * interpreters and the catalog while the published copy went on describing an
+ * `asset` of three fields, and a client generating stubs from that copy would
+ * have dropped the field without a word.
+ */
+export function schemaStepFields(): string[] {
+  return Object.entries(publishedStep())
+    .flatMap(([operation, body]) =>
+      body.properties
+        ? Object.keys(body.properties).map((field) => `${operation}.${field}`)
+        : [operation]
+    )
+    .sort()
 }
 
 /** Does this body check anything, at any nesting depth? */
@@ -117,6 +143,21 @@ export async function catalogValidate(options: CatalogValidateOptions) {
         'schema/test-definition.schema.json and the Zod vocabulary disagree' +
           (missing.length > 0 ? ` — missing from the JSON Schema: ${missing.join(', ')}` : '') +
           (extra.length > 0 ? ` — only in the JSON Schema: ${extra.join(', ')}` : '')
+      )
+    }
+
+    const declaredFields = zodStepFields()
+    const publishedFields = schemaStepFields()
+    const missingFields = declaredFields.filter((field) => !publishedFields.includes(field))
+    const extraFields = publishedFields.filter((field) => !declaredFields.includes(field))
+
+    if (missingFields.length > 0 || extraFields.length > 0) {
+      failures.push(
+        'schema/test-definition.schema.json and the Zod vocabulary disagree about step fields' +
+          (missingFields.length > 0
+            ? ` — missing from the JSON Schema: ${missingFields.join(', ')}`
+            : '') +
+          (extraFields.length > 0 ? ` — only in the JSON Schema: ${extraFields.join(', ')}` : '')
       )
     }
 

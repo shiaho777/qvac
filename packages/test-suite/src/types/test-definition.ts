@@ -82,12 +82,13 @@ export const stepSchema: z.ZodType<Step> = z.lazy(() =>
           kind: z.string().describe('Asset family, e.g. "image", "audio", "text"'),
           file: z.string().describe('Asset path relative to the platform asset root'),
           form: z
-            .enum(['bytes', 'path'])
+            .enum(['bytes', 'path', 'text'])
             .optional()
             .describe(
-              'What to bind: the contents, or a reference the SDK can open. Which one an ' +
-                'API wants is part of its contract, and the path form is what a filesystem ' +
-                'path on desktop and a bundled-asset URI on mobile have in common'
+              'What to bind: the contents as bytes, a reference the SDK can open, or the ' +
+                'contents decoded as UTF-8 text. Which one an API wants is part of its ' +
+                'contract, and the path form is what a filesystem path on desktop and a ' +
+                'bundled-asset URI on mobile have in common'
             ),
           as: z.string().describe('Bind the resolved asset reference under this name')
         })
@@ -204,7 +205,7 @@ export const stepSchema: z.ZodType<Step> = z.lazy(() =>
 export type Step =
   | { useModel: { deps: string[]; as?: string } }
   | { modelSource: { dep: string; as: string } }
-  | { asset: { kind: string; file: string; form?: 'bytes' | 'path'; as: string } }
+  | { asset: { kind: string; file: string; form?: 'bytes' | 'path' | 'text'; as: string } }
   | {
       call: {
         method: string
@@ -253,6 +254,29 @@ export type Step =
  * this against the language-neutral JSON Schema, which is the copy a client in
  * another language reads.
  */
+/**
+ * The fields each operation declares, `operation.field`.
+ *
+ * Names alone were not enough: `asset.form` reached Zod, both interpreters and
+ * the catalog while the JSON Schema went on describing an `asset` of three
+ * fields, and the name-level check saw two vocabularies that agreed. A client
+ * generating stubs from the published copy would have dropped the field
+ * silently.
+ */
+export function zodStepFields(): string[] {
+  const lazy = stepSchema as unknown as { _def: { getter: () => { options: unknown[] } } }
+  const options = lazy._def.getter().options as Array<{ shape: Record<string, unknown> }>
+  return options
+    .flatMap((option) =>
+      Object.entries(option.shape).flatMap(([operation, body]) => {
+        const shape = (body as { shape?: Record<string, unknown> }).shape
+        if (!shape) return [operation]
+        return Object.keys(shape).map((field) => `${operation}.${field}`)
+      })
+    )
+    .sort()
+}
+
 export function zodStepOperations(): string[] {
   const lazy = stepSchema as unknown as { _def: { getter: () => { options: unknown[] } } }
   const options = lazy._def.getter().options as Array<{ shape: Record<string, unknown> }>

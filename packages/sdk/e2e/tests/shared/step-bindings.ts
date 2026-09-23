@@ -27,6 +27,7 @@ import {
   modelRegistryList,
   modelRegistrySearch,
   ocr,
+  ragCloseWorkspace,
   ragDeleteWorkspace,
   ragIngest,
   resume,
@@ -116,6 +117,10 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
 
   // --- rag and vector index ------------------------------------------------
   ragIngest: (params) => ragIngest(params),
+  ragCloseWorkspace: async (params) => {
+    await ragCloseWorkspace(params)
+    return { closed: true }
+  },
   ragDeleteWorkspace: async (params) => {
     await ragDeleteWorkspace(params)
     return { deleted: true }
@@ -862,7 +867,9 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
       // On desktop the path form is a filesystem path; a mobile binding hands
       // back a bundled-asset URI for the same pair, which is the entire reason
       // several categories still carry two executors.
-      return form === 'path' ? absolute : new Uint8Array(fs.readFileSync(absolute))
+      if (form === 'path') return absolute
+      if (form === 'text') return fs.readFileSync(absolute, 'utf-8')
+      return new Uint8Array(fs.readFileSync(absolute))
     },
 
     assertions: ASSERTIONS,

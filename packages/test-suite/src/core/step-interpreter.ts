@@ -36,7 +36,7 @@ export interface StepBindings {
    * and the path form is what a filesystem path on desktop and a bundled-asset
    * URI on mobile have in common.
    */
-  asset?(kind: string, file: string, form: 'bytes' | 'path'): Promise<unknown>
+  asset?(kind: string, file: string, form: 'bytes' | 'path' | 'text'): Promise<unknown>
 
   /**
    * The model source behind a resource key, without loading it.
