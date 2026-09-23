@@ -196,14 +196,27 @@ const STREAMS: Record<string, Fold> = {
   },
 
   ocr: async (params, collect) => {
+    const p = params as unknown as { stream?: boolean }
     const run = ocr(params)
-    if (collect === 'blocks') return { blocks: await run.blocks }
-    if (collect === 'all') return { all: await drain(run.blockStream) }
+
+    // `blocks` resolves empty in streaming mode, the same trap `translate`
+    // has: the fold must follow the call's own mode rather than always await
+    // the same handle, or a streaming test asserts on nothing and says so
+    // only if the expectation happens to be strict.
+    const blocks = p.stream ? (await drain(run.blockStream)).flat() : await run.blocks
+
+    // `stats` rides along with every fold: a test that checks timing asks for
+    // it from the same run, and a second call would time a different one.
+    const stats = await run.stats
+
+    if (collect === 'blocks') return { blocks, stats }
+    if (collect === 'all' || collect === 'events') return { all: blocks, events: blocks, stats }
     if (collect === 'text') {
-      const blocks = await run.blocks
-      return { text: blocks.map((block) => block.text).join('\n') }
+      // Space, not newline: this is what the executors joined with, and a
+      // migrated test has to reproduce what its executor produced or it is not
+      // migrated.
+      return { text: blocks.map((block) => block.text).join(' '), stats }
     }
-    if (collect === 'events') return { events: await drain(run.blockStream) }
     throw unsupported('ocr', collect)
   },
 
@@ -535,6 +548,61 @@ const ASSERTIONS: Record<
     }
 
     return { passed: true, output: `tool call(s): ${valid.map((call) => call.name).join(', ')}` }
+  },
+
+  /**
+   * Every block carries the geometry a caller needs to place it.
+   *
+   * The OCR executors checked this inline; as a named assertion it is the same
+   * check on every client, which is the difference between two clients
+   * agreeing and two clients each having an opinion.
+   */
+  textBlockShape(value) {
+    const blocks = (Array.isArray(value) ? value : []) as Array<{
+      text?: unknown
+      bbox?: unknown
+      confidence?: unknown
+    }>
+    for (const [index, block] of blocks.entries()) {
+      if (typeof block.text !== 'string') {
+        return { passed: false, output: `block[${index}].text is not a string` }
+      }
+      const bbox = block.bbox
+      if (!Array.isArray(bbox) || bbox.length !== 4) {
+        return { passed: false, output: `block[${index}].bbox is not a 4-element array` }
+      }
+      const bad = bbox.findIndex((coordinate) => typeof coordinate !== 'number')
+      if (bad !== -1) {
+        return { passed: false, output: `block[${index}].bbox[${bad}] is not a number` }
+      }
+      if (typeof block.confidence !== 'number') {
+        return { passed: false, output: `block[${index}].confidence is not a number` }
+      }
+    }
+    return { passed: true, output: `${blocks.length} well-formed block(s)` }
+  },
+
+  /**
+   * The run reported how long it took.
+   *
+   * `field` names which timing to insist on, because the engines do not agree
+   * on what they measure -- and a test that only checks "stats exist" passes
+   * on an object full of nulls.
+   */
+  timingStatsPresent(value, args) {
+    if (!value || typeof value !== 'object') {
+      return { passed: false, output: 'stats is undefined, expected timing data' }
+    }
+    const stats = value as Record<string, unknown>
+    const field = String(args.field ?? 'totalTime')
+    const measured = stats[field]
+    if (typeof measured !== 'number' || measured <= 0) {
+      return {
+        passed: false,
+        output: `expected stats.${field} > 0, got ${JSON.stringify(measured)}`
+      }
+    }
+    return { passed: true, output: `${field}=${measured}` }
   },
 
   loadedModelInfoShape(value, args) {

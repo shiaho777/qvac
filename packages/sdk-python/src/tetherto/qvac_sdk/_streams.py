@@ -106,6 +106,7 @@ def _pump(
 
     async def run_pump() -> None:
         gathered: list[Any] = []
+        stats: Any = None
         failure: BaseException | None = None
         try:
             async for chunk in chunks(transport, request):
@@ -116,28 +117,28 @@ def _pump(
                     for tick in progress_of(chunk):
                         run._progress.put_nowait(tick)
 
-                stats = getattr(chunk, "stats", None)
-                if stats is not None and not run.stats.done():
-                    run.stats.set_result(stats)
-                if getattr(chunk, "done", False) and not run.done.done():
-                    run.done.set_result(True)
+                chunk_stats = getattr(chunk, "stats", None)
+                if chunk_stats is not None:
+                    stats = chunk_stats
         except Exception as error:  # noqa: BLE001 - surfaced on every handle
             failure = error
 
+        # Settled here and only here, in this order. `done` is what the derived
+        # handles wait on -- a run's flattened blocks, its assembled audio --
+        # and settling it inside the loop, on the terminal chunk, fired those
+        # callbacks while `collected` was still empty: they raised
+        # InvalidStateError, their own futures never resolved, and every caller
+        # awaiting one waited until the test timed out. The ordering is the
+        # contract, not an optimisation.
         if failure is not None:
             for future in (run.collected, run.stats, run.done):
                 if not future.done():
                     future.set_exception(failure)
                     _silence(future)
         else:
-            if not run.collected.done():
-                run.collected.set_result(gathered)
-            # A stream that ends without a terminal chunk still has to settle
-            # its handles, or a caller awaiting `stats` waits for ever.
-            if not run.stats.done():
-                run.stats.set_result(None)
-            if not run.done.done():
-                run.done.set_result(True)
+            run.collected.set_result(gathered)
+            run.stats.set_result(stats)
+            run.done.set_result(True)
 
         run._items.put_nowait(_END)
         run._progress.put_nowait(_END)
@@ -153,6 +154,38 @@ def _silence(future: asyncio.Future[Any]) -> None:
     logs a spurious warning for a failure that was already reported.
     """
     future.add_done_callback(lambda f: f.cancelled() or f.exception())
+
+
+def _derive(
+    run: StreamRun[Any],
+    target: asyncio.Future[Any],
+    compute: Callable[[list[Any]], Any],
+) -> None:
+    """Settle `target` from the collected pieces once the run finishes.
+
+    A run exposes handles the pump does not fill directly -- flattened blocks,
+    assembled audio, a joined description. They are derived here rather than in
+    an ad-hoc callback per method, because the failure mode of getting it wrong
+    is silent: a callback that raises leaves its future unresolved and every
+    caller awaiting it waits until something else times out. This one cannot
+    raise into the event loop; if the run failed, the failure is what the
+    derived handle carries.
+    """
+
+    def settle(_finished: asyncio.Future[Any]) -> None:
+        if target.done():
+            return
+        try:
+            error = run.collected.exception() if run.collected.done() else None
+            if error is not None:
+                target.set_exception(error)
+            else:
+                target.set_result(compute(run.collected.result()))
+        except Exception as problem:  # noqa: BLE001 - never lose the handle
+            target.set_exception(problem)
+        _silence(target)
+
+    run.done.add_done_callback(settle)
 
 
 def _decode(data: str | None) -> bytes:
@@ -204,15 +237,24 @@ def _payload(request: Any, **fields: Any) -> dict[str, Any]:
 
 
 class OcrRun(StreamRun[Any]):
-    """Mirrors JS's `{ blockStream, blocks, stats }`."""
+    """Mirrors JS's `{ blockStream, blocks, stats }`.
+
+    `block_stream` yields a *batch* per chunk, as JS's `blockStream` does, and
+    `blocks` is the flattened whole. The distinction matters: a caller written
+    against one client and run on the other would otherwise iterate blocks
+    where it expected batches, and silently read a block's fields as if they
+    were blocks.
+    """
+
+    def __init__(self, request_id: str) -> None:
+        super().__init__(request_id)
+        self.blocks: asyncio.Future[list[Any]] = (
+            asyncio.get_running_loop().create_future()
+        )
 
     @property
     def block_stream(self) -> AsyncIterator[Any]:
         return self.stream
-
-    @property
-    def blocks(self) -> asyncio.Future[list[Any]]:
-        return self.collected
 
 
 def ocr(
@@ -240,7 +282,13 @@ def ocr(
         transport,
         request,
         _methods.ocr_stream,
-        items_of=lambda chunk: chunk.blocks or [],
+        # One item per chunk -- the batch -- so the generator yields what JS's
+        # blockStream yields.
+        items_of=lambda chunk: (chunk.blocks,) if chunk.blocks else (),
+    )
+
+    _derive(
+        run, run.blocks, lambda batches: [block for batch in batches for block in batch]
     )
     return run
 
@@ -411,24 +459,16 @@ def _audio_run(
         ),
     )
 
-    def settle(_f: asyncio.Future[Any]) -> None:
-        if run.audio.done():
-            return
-        error = run.collected.exception() if run.collected.done() else None
-        if error is not None:
-            run.audio.set_exception(error)
-            _silence(run.audio)
-            return
-        run.audio.set_result(
-            {
-                "data": b"".join(run.collected.result()),
-                "sampleRate": format_seen.get("sample_rate"),
-                "channels": format_seen.get("channels"),
-                "bitsPerSample": format_seen.get("bits_per_sample"),
-            }
-        )
-
-    run.done.add_done_callback(settle)
+    _derive(
+        run,
+        run.audio,
+        lambda parts: {
+            "data": b"".join(parts),
+            "sampleRate": format_seen.get("sample_rate"),
+            "channels": format_seen.get("channels"),
+            "bitsPerSample": format_seen.get("bits_per_sample"),
+        },
+    )
     return run
 
 
@@ -511,17 +551,7 @@ def audio_understand(
         ),
     )
 
-    def settle(_f: asyncio.Future[Any]) -> None:
-        if run.description.done():
-            return
-        error = run.collected.exception() if run.collected.done() else None
-        if error is not None:
-            run.description.set_exception(error)
-            _silence(run.description)
-        else:
-            run.description.set_result("".join(run.collected.result()))
-
-    run.done.add_done_callback(settle)
+    _derive(run, run.description, lambda parts: "".join(parts))
     return run
 
 
@@ -608,18 +638,7 @@ def world_create_scene(
         items_of=lambda chunk: (_decode(chunk.data),) if chunk.data else (),
     )
 
-    def settle(_f: asyncio.Future[Any]) -> None:
-        if run.scene.done():
-            return
-        error = run.collected.exception() if run.collected.done() else None
-        if error is not None:
-            run.scene.set_exception(error)
-            _silence(run.scene)
-        else:
-            parts = run.collected.result()
-            run.scene.set_result(b"".join(parts) if parts else None)
-
-    run.done.add_done_callback(settle)
+    _derive(run, run.scene, lambda parts: b"".join(parts) if parts else None)
     return run
 
 

@@ -174,6 +174,50 @@ def tool_call_shape(value: Any, args: dict[str, Any]) -> StepResult:
     )
 
 
+def text_block_shape(value: Any, args: dict[str, Any]) -> StepResult:
+    """Every block carries the geometry a caller needs to place it.
+
+    The OCR executors checked this inline; as a named assertion it is the same
+    check on every client, which is the difference between two clients agreeing
+    and two clients each having an opinion.
+    """
+    blocks = value if isinstance(value, list) else []
+    for index, block in enumerate(blocks):
+        block = block if isinstance(block, dict) else {}
+        if not isinstance(block.get("text"), str):
+            return StepResult.fail(f"block[{index}].text is not a string")
+        bbox = block.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return StepResult.fail(f"block[{index}].bbox is not a 4-element array")
+        for position, coordinate in enumerate(bbox):
+            if not isinstance(coordinate, (int, float)) or isinstance(coordinate, bool):
+                return StepResult.fail(
+                    f"block[{index}].bbox[{position}] is not a number"
+                )
+        confidence = block.get("confidence")
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+            return StepResult.fail(f"block[{index}].confidence is not a number")
+    return StepResult.ok(f"{len(blocks)} well-formed block(s)")
+
+
+def timing_stats_present(value: Any, args: dict[str, Any]) -> StepResult:
+    """The run reported how long it took.
+
+    `field` names which timing to insist on, because the engines do not agree
+    on what they measure -- and a test that only checks "stats exist" passes on
+    an object full of nulls.
+    """
+    if not isinstance(value, dict):
+        return StepResult.fail("stats is undefined, expected timing data")
+    field = str(args.get("field") or "totalTime")
+    measured = value.get(field)
+    if not isinstance(measured, (int, float)) or isinstance(measured, bool):
+        return StepResult.fail(f"expected stats.{field} > 0, got {measured!r}")
+    if measured <= 0:
+        return StepResult.fail(f"expected stats.{field} > 0, got {measured!r}")
+    return StepResult.ok(f"{field}={measured}")
+
+
 def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """`getLoadedModelInfo` returned a record describing the model we loaded.
 
@@ -217,5 +261,7 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "nonEmptyText": non_empty_text,
     "errorMatches": error_matches,
     "toolCallShape": tool_call_shape,
+    "textBlockShape": text_block_shape,
+    "timingStatsPresent": timing_stats_present,
     "loadedModelInfoShape": loaded_model_info_shape,
 }

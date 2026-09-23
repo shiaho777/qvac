@@ -299,15 +299,31 @@ async def _ocr_stream(transport: Any, params: dict[str, Any], collect: str) -> A
         image=params["image"],
         options=params.get("options"),
     )
-    if collect == "blocks":
-        return {"blocks": _jsonable(await run.blocks)}
-    if collect == "all":
-        return {"all": _jsonable([block async for block in run.block_stream])}
-    if collect == "events":
-        return {"events": _jsonable([block async for block in run.block_stream])}
-    if collect == "text":
+    # `blocks` resolves empty in streaming mode, the same trap `translate` has:
+    # the fold follows the call's own mode rather than always awaiting the same
+    # handle.
+    if params.get("stream"):
+        batches = [batch async for batch in run.block_stream]
+        blocks = [block for batch in batches for block in batch]
+    else:
         blocks = await run.blocks
-        return {"text": "\n".join(getattr(b, "text", "") or "" for b in blocks)}
+
+    # `stats` rides along with every fold: a test that checks timing asks for
+    # it from the same run, and a second call would time a different one.
+    stats = _jsonable(await run.stats)
+
+    if collect == "blocks":
+        return {"blocks": _jsonable(blocks), "stats": stats}
+    if collect in ("all", "events"):
+        folded = _jsonable(blocks)
+        return {"all": folded, "events": folded, "stats": stats}
+    if collect == "text":
+        # Space, not newline: this is what the executors joined with, and a
+        # migrated test has to reproduce what its executor produced.
+        return {
+            "text": " ".join(getattr(b, "text", "") or "" for b in blocks),
+            "stats": stats,
+        }
     raise StepError(f'collect: "{collect}" is not defined for ocr', incomplete=True)
 
 
