@@ -155,48 +155,24 @@ export const parakeetStreamUnifiedHappy: TestDefinition = {
   }
 }
 
-export const parakeetStreamMetadataRejected: TestDefinition = {
-  testId: 'parakeet-stream-metadata-rejected',
-  // The rejection surfaces when the stream is read, not when it is opened, so
-  // the drain is what has to fail. Both terms are required: a message that
-  // said only "unsupported" would pass for any refusal at all.
-  steps: [
-    { useModel: { deps: ['parakeet-tdt'], as: 'model' } },
-    {
-      call: {
-        method: 'transcribeStreamOpen',
-        params: {
-          modelId: '$model',
-          metadata: true,
-          parakeetStreamingConfig: { chunkMs: '$params.chunkMs' }
-        },
-        as: 'session'
-      }
-    },
-    { project: { from: '$session', path: 'sessionId', as: 'sessionId' } },
-    { call: { method: 'transcribeStreamEnd', params: { sessionId: '$sessionId' } } },
-    {
-      callError: {
-        method: 'transcribeStreamDrain',
-        collect: 'events',
-        params: { sessionId: '$sessionId' },
-        as: 'err'
-      }
-    },
-    { project: { from: '$err', path: 'message', as: 'message' } },
-    { assert: { on: '$message', named: 'containsAll', with: { terms: ['metadata'] } } },
-    { assert: { on: '$message', named: 'containsAll', with: { terms: ['parakeet'] } } }
-  ],
-  finally: destroySession,
+/**
+ * Per-segment metadata over the duplex stream: same paced feed as the happy
+ * path, with `metadata: true`, so the session surfaces `segment` events
+ * carrying timings and the parakeet-only `isEndOfTurn` / `startsWord` flags.
+ */
+export const parakeetStreamMetadata: TestDefinition = {
+  testId: 'parakeet-stream-metadata',
   params: {
     audioFileName: AUDIO_FIXTURE,
-    chunkMs: 1000
+    chunkMs: 1000,
+    emitPartials: true,
+    trailingSilenceMs: 1500
   },
   expectation: { validation: 'function', fn: () => true },
   metadata: {
     category: 'parakeet',
     dependency: 'parakeet-tdt',
-    estimatedDurationMs: 60000
+    estimatedDurationMs: 120000
   }
 }
 
@@ -456,8 +432,24 @@ export const parakeetStreamIteratorThrow: TestDefinition = {
 export const parakeetStreamTests = [
   parakeetStreamHappy,
   parakeetStreamUnifiedHappy,
-  parakeetStreamMetadataRejected,
+  parakeetStreamMetadata,
   parakeetStreamEou,
   parakeetStreamDestroyMidUtterance,
   parakeetStreamIteratorThrow
 ]
+
+/**
+ * `parakeet-stream-metadata` still runs from its imperative body.
+ *
+ * The blocker is the path language, not the assertions: in metadata mode the
+ * segments arrive wrapped one per event, so the body needs `events[*].segment`
+ * over a list whose other event types carry no `segment` at all, and today a
+ * wildcard walk throws on the first item that lacks the field instead of
+ * passing over it. The batch sibling (`parakeet-tdt-metadata`) has no wrapper
+ * and is migrated; this one follows once the walk can skip a missing field.
+ */
+parakeetStreamMetadata.skip = {
+  reason:
+    'the Python client has no body for this: the segments arrive one per event and the wildcard path cannot yet skip events that carry no segment, so the declarative body is not writable',
+  platforms: ['desktop-python']
+}

@@ -241,7 +241,7 @@ export const transcriptionMetadataBatch: TestDefinition = {
         as: 'run'
       }
     },
-    { project: { from: '$run', path: 'text', as: 'segments' } },
+    { project: { from: '$run', path: 'segments', as: 'segments' } },
     { assert: { on: '$segments', named: 'transcriptSegmentsShape' } }
   ],
   metadata: {

@@ -449,14 +449,19 @@ def no_partial_downloads(value: Any, _args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(events)} cache-hit notification(s)")
 
 
-def transcript_segments_shape(value: Any, _args: dict[str, Any]) -> StepResult:
+def transcript_segments_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """Transcript segments are well formed and in audio-time order.
 
     Every field the consumer of a metadata transcription reads, plus the
     ordering invariant: segments are emitted in audio time, and ids only go
     forward. Out-of-order segments would reassemble into the wrong transcript
     without any single segment looking wrong.
+
+    `flags` names extra boolean fields every segment must carry: parakeet adds
+    `isEndOfTurn` / `startsWord`, whisper does not, and the difference is the
+    whole point of the parakeet metadata test.
     """
+    flags = args.get("flags") or []
     if not isinstance(value, list):
         return StepResult.fail(f"expected an array, got {type(value).__name__}")
     if not value:
@@ -484,6 +489,9 @@ def transcript_segments_shape(value: Any, _args: dict[str, Any]) -> StepResult:
         segment_id = segment.get("id")
         if not isinstance(segment_id, int) or isinstance(segment_id, bool):
             return StepResult.fail(f"segment {index}: missing/invalid id")
+        for flag in flags:
+            if not isinstance(segment.get(flag), bool):
+                return StepResult.fail(f"segment {index}: missing/invalid {flag}")
         if start_ms < previous_start:
             return StepResult.fail(
                 f"segment {index}: out-of-order startMs {start_ms} < {previous_start}"
@@ -494,7 +502,8 @@ def transcript_segments_shape(value: Any, _args: dict[str, Any]) -> StepResult:
             )
         previous_start = start_ms
         previous_id = segment_id
-    return StepResult.ok(f"{len(value)} segment(s) in order")
+    carried = f", all carrying {' / '.join(flags)}" if flags else ""
+    return StepResult.ok(f"{len(value)} segment(s) in order{carried}")
 
 
 def event_type_counts(value: Any, args: dict[str, Any]) -> StepResult:

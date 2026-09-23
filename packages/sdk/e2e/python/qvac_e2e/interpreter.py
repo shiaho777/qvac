@@ -553,9 +553,10 @@ async def _transcribe(transport: Any, params: dict[str, Any]) -> Any:
             text += response.text
         if getattr(response, "done", False):
             break
-    # JS binds the value itself; the catalog projects `text` off it, and with
-    # `metadata` that field carries the segments -- the same shape both ways.
-    return {"text": segments if want_segments else text}
+    # Bound under the name that says what came back, exactly as JS binds it:
+    # `metadata` returns segments, not a transcript, and a body projecting
+    # `text` off one would be reading records under a string's name.
+    return {"segments": segments} if want_segments else {"text": text}
 
 
 async def _vector_index_dispose(transport: Any, params: dict[str, Any]) -> Any:

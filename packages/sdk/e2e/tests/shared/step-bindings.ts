@@ -80,7 +80,18 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
   // --- inference, request/reply -------------------------------------------
   embed: (params) => embed(params),
   classify: async (params) => ({ results: await classify(params) }),
-  transcribe: async (params) => ({ text: await transcribe(params) }),
+  /**
+   * One transcription, bound under the name that says what came back:
+   * `metadata` swaps the flat transcript for per-segment records, so a body
+   * that projected `text` off a metadata run would be reading segments under
+   * a field that promises a string.
+   */
+  transcribe: async (params) => {
+    const result = await transcribe(params)
+    return (params as { metadata?: boolean }).metadata === true
+      ? { segments: result }
+      : { text: result }
+  },
   bciTranscribe: async (params) => ({ text: await bciTranscribe(params) }),
   vla: (params) => vla(params),
   vlaHparams: (params) => vlaHparams(params),
@@ -1904,8 +1915,13 @@ const ASSERTIONS: Record<
    * ordering invariant: segments are emitted in audio time, and ids only go
    * forward. Out-of-order segments would reassemble into the wrong transcript
    * without any single segment looking wrong.
+   *
+   * `flags` names extra boolean fields every segment must carry: parakeet adds
+   * `isEndOfTurn` / `startsWord`, whisper does not, and the difference is the
+   * whole point of the parakeet metadata test.
    */
-  transcriptSegmentsShape(value) {
+  transcriptSegmentsShape(value, args) {
+    const { flags = [] } = (args ?? {}) as { flags?: string[] }
     const segments = value as Array<Record<string, unknown>>
     if (!Array.isArray(segments)) {
       return { passed: false, output: `expected an array, got ${typeof value}` }
@@ -1941,6 +1957,11 @@ const ASSERTIONS: Record<
       if (typeof id !== 'number' || !Number.isInteger(id)) {
         return { passed: false, output: `segment ${index}: missing/invalid id` }
       }
+      for (const flag of flags) {
+        if (typeof segment[flag] !== 'boolean') {
+          return { passed: false, output: `segment ${index}: missing/invalid ${flag}` }
+        }
+      }
       if (startMs < previousStart) {
         return {
           passed: false,
@@ -1953,7 +1974,8 @@ const ASSERTIONS: Record<
       previousStart = startMs
       previousId = id
     }
-    return { passed: true, output: `${segments.length} segment(s) in order` }
+    const carried = flags.length > 0 ? `, all carrying ${flags.join(' / ')}` : ''
+    return { passed: true, output: `${segments.length} segment(s) in order${carried}` }
   },
 
   /**
