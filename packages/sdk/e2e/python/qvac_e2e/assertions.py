@@ -249,6 +249,50 @@ def is_true(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok("true")
 
 
+def positive_integers(value: Any, args: dict[str, Any]) -> StepResult:
+    """Every named field is a positive integer.
+
+    Model hyper-parameters are the recurring case: a chunk size or an action
+    dimension that arrives as 0, a float, or a string is a broken model
+    description however well-formed the surrounding object looks.
+    """
+    record = value if isinstance(value, dict) else {}
+    fields: list[str] = args.get("fields") or []
+    for field in fields:
+        measured = record.get(field)
+        if not isinstance(measured, int) or isinstance(measured, bool) or measured <= 0:
+            return StepResult.fail(
+                f"{field} is not a positive integer (got {measured!r})"
+            )
+    return StepResult.ok(f"{len(fields)} field(s) positive")
+
+
+def value_in(value: Any, args: dict[str, Any]) -> StepResult:
+    """The value is one of a known set. `allowNull` admits "not reported"."""
+    if value is None and args.get("allowNull"):
+        return StepResult.ok("null")
+    allowed = args.get("values") or []
+    if value not in allowed:
+        return StepResult.fail(f"{value!r} is not one of {allowed!r}")
+    return StepResult.ok(str(value))
+
+
+def field_equals(value: Any, args: dict[str, Any]) -> StepResult:
+    """Two fields of the same object agree.
+
+    For the invariants a result carries about itself -- a buffer whose length
+    must equal the product of the dimensions reported beside it.
+    """
+    record = value if isinstance(value, dict) else {}
+    left = record.get(str(args.get("field")))
+    right = record.get(str(args.get("other")))
+    if left != right:
+        return StepResult.fail(
+            f"{args.get('field')}={left!r} != {args.get('other')}={right!r}"
+        )
+    return StepResult.ok(f"{args.get('field')} == {args.get('other')}")
+
+
 def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
     """`getLoadedModelInfo` returned a record describing the model we loaded.
 
@@ -296,5 +340,8 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "timingStatsPresent": timing_stats_present,
     "producedAudio": produced_audio,
     "isTrue": is_true,
+    "positiveIntegers": positive_integers,
+    "valueIn": value_in,
+    "fieldEquals": field_equals,
     "loadedModelInfoShape": loaded_model_info_shape,
 }

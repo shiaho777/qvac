@@ -641,6 +641,59 @@ const ASSERTIONS: Record<
     return { passed: true, output: 'true' }
   },
 
+  /**
+   * Every named field is a positive integer.
+   *
+   * Model hyper-parameters are the recurring case: a chunk size or an action
+   * dimension that arrives as 0, a float, or a string is a broken model
+   * description however well-formed the surrounding object looks.
+   */
+  positiveIntegers(value, args) {
+    const record = (value ?? {}) as Record<string, unknown>
+    for (const field of (args.fields ?? []) as string[]) {
+      const measured = record[field]
+      if (typeof measured !== 'number' || !Number.isInteger(measured) || measured <= 0) {
+        return {
+          passed: false,
+          output: `${field} is not a positive integer (got ${JSON.stringify(measured)})`
+        }
+      }
+    }
+    return { passed: true, output: `${(args.fields as string[]).length} field(s) positive` }
+  },
+
+  /** The value is one of a known set. `allowNull` admits "not reported". */
+  valueIn(value, args) {
+    if (value === null && args.allowNull) return { passed: true, output: 'null' }
+    const allowed = (args.values ?? []) as unknown[]
+    if (!allowed.includes(value)) {
+      return {
+        passed: false,
+        output: `${JSON.stringify(value)} is not one of ${JSON.stringify(allowed)}`
+      }
+    }
+    return { passed: true, output: String(value) }
+  },
+
+  /**
+   * Two fields of the same object agree.
+   *
+   * For the invariants a result carries about itself -- a buffer whose length
+   * must equal the product of the dimensions reported beside it.
+   */
+  fieldEquals(value, args) {
+    const record = (value ?? {}) as Record<string, unknown>
+    const left = record[String(args.field)]
+    const right = record[String(args.other)]
+    if (left !== right) {
+      return {
+        passed: false,
+        output: `${String(args.field)}=${JSON.stringify(left)} != ${String(args.other)}=${JSON.stringify(right)}`
+      }
+    }
+    return { passed: true, output: `${String(args.field)} == ${String(args.other)}` }
+  },
+
   loadedModelInfoShape(value, args) {
     const info = value as {
       modelId?: string

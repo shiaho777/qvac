@@ -207,3 +207,24 @@ export const cancellationTests = [
   cancelByRequestIdTranscribe,
   cancelByRequestIdRagIngest
 ]
+
+/**
+ * Not runnable on the Python client yet.
+ *
+ * A skip rather than an `incomplete`, decided deliberately: these are the
+ * definitions the step vocabulary cannot express, so they would otherwise sit
+ * in the Python column as debt with no owner and no date. The reason travels
+ * with the rule, which is what keeps the skip auditable -- and they become
+ * runnable the moment the per-client imperative bodies are written.
+ *
+ * Only definitions with no declarative body are skipped; anything already
+ * migrated runs on Python like everywhere else.
+ */
+for (const test of cancellationTests) {
+  if (test.steps || test.skip) continue
+  test.skip = {
+    reason:
+      'the Python client has no body for this: it cancels a generation mid-flight, and the vocabulary has no way to start a call without awaiting it, so the Python client needs a hand-written body before this can run there',
+    platforms: ['desktop-python']
+  }
+}

@@ -1,4 +1,4 @@
-import type { TestDefinition } from '@qvac/test-suite'
+import type { Step, TestDefinition } from '@qvac/test-suite'
 
 // SmolVLA-LIBERO inference always returns a chunkSize × actionDim Float32Array
 // of robot actions plus per-stage timings. These tests exercise the SDK's
@@ -497,6 +497,62 @@ export const vlaGrootMultiSetEmbodiment = createVlaTest(
   'vla-groot-multi'
 )
 
+/**
+ * Reading a model's hyper-parameters and checking they describe a usable model.
+ *
+ * The executors checked this with a JavaScript function, which cannot cross to
+ * another client. As two named assertions it is the same check everywhere:
+ * every dimension a positive integer, and the backend one the runtime actually
+ * has -- or null, which means "not reported" rather than "wrong".
+ */
+const vlaHparamsSteps = (dependency: string): Step[] => [
+  { useModel: { deps: [dependency], as: 'model' } },
+  { call: { method: 'vlaHparams', params: { modelId: '$model' }, as: 'run' } },
+  { project: { from: '$run', path: 'hparams', as: 'hparams' } },
+  {
+    assert: {
+      on: '$hparams',
+      named: 'positiveIntegers',
+      with: {
+        fields: [
+          'chunkSize',
+          'actionDim',
+          'maxActionDim',
+          'maxStateDim',
+          'tokenizerMaxLength',
+          'visionImageSize'
+        ]
+      }
+    }
+  },
+  { project: { from: '$run', path: 'backendName', as: 'backend' } },
+  {
+    assert: {
+      on: '$backend',
+      named: 'valueIn',
+      with: { values: ['CPU', 'Metal', 'Vulkan', 'OpenCL'], allowNull: true }
+    }
+  }
+]
+
+/**
+ * Tests that feed the model generated tensors -- images, state, tokens, a
+ * mask -- and check the actions that come back. The vocabulary has no way to
+ * describe building those arrays, and putting a megabyte of synthetic floats
+ * in a definition would not make it data in any useful sense, so they keep
+ * their hand-written bodies.
+ */
+const VLA_SYNTHETIC_INPUTS = new Set([
+  'vla-run-synthetic-shape',
+  'vla-run-stats',
+  'vla-invalid-img-size',
+  'vla-pi05-run-synthetic-shape',
+  'vla-pi05-run-stats',
+  'vla-pi05-invalid-img-size',
+  'vla-groot-run-synthetic-shape',
+  'vla-groot-multi-set-embodiment'
+])
+
 export const vlaTests: TestDefinition[] = [
   vlaHparamsShape,
   vlaRunSyntheticShape,
@@ -511,3 +567,30 @@ export const vlaTests: TestDefinition[] = [
   vlaGrootMultiHparamsShape,
   vlaGrootMultiSetEmbodiment
 ]
+
+/** Attach the hyper-parameter body; the tensor-fed tests keep theirs. */
+for (const test of vlaTests) {
+  if (test.steps || VLA_SYNTHETIC_INPUTS.has(test.testId)) continue
+  test.steps = vlaHparamsSteps(String(test.metadata?.dependency ?? 'vla'))
+}
+
+/**
+ * Not runnable on the Python client yet.
+ *
+ * A skip rather than an `incomplete`, decided deliberately: these are the
+ * definitions the step vocabulary cannot express, so they would otherwise sit
+ * in the Python column as debt with no owner and no date. The reason travels
+ * with the rule, which is what keeps the skip auditable -- and they become
+ * runnable the moment the per-client imperative bodies are written.
+ *
+ * Only definitions with no declarative body are skipped; anything already
+ * migrated runs on Python like everywhere else.
+ */
+for (const test of vlaTests) {
+  if (test.steps || test.skip) continue
+  test.skip = {
+    reason:
+      'the Python client has no body for this: it feeds the model generated tensors -- images, state, tokens, a mask -- which the step vocabulary has no way to describe, so the Python client needs a hand-written body before this can run there',
+    platforms: ['desktop-python']
+  }
+}
