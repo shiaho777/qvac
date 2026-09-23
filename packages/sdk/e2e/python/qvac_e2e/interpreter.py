@@ -66,6 +66,7 @@ from tetherto.qvac_sdk import (
     state,
     suspend,
     transcribe,
+    bci_transcribe_stream_session,
     transcribe_stream_session,
     audio_edit,
     audio_gen,
@@ -226,6 +227,42 @@ async def _transcribe_stream_write_chunks(
         session.write(speech[offset : offset + chunk_size])
         written += 1
     return {"chunks": written}
+
+
+async def _bci_transcribe_stream_open(transport: Any, params: dict[str, Any]) -> Any:
+    """The BCI duplex session, in the same registry as the transcription ones.
+
+    Its input is raw neural samples rather than audio, so it has its own open
+    and its own write; everything after that -- end, drain, destroy -- is the
+    same session surface.
+    """
+    global _TRANSCRIBE_SESSION_SEQ
+    session = bci_transcribe_stream_session(
+        transport,
+        model_id=params["modelId"],
+        **{k: v for k, v in params.items() if k != "modelId"},
+    )
+    _TRANSCRIBE_SESSION_SEQ += 1
+    session_id = f"session-{_TRANSCRIBE_SESSION_SEQ}"
+    _TRANSCRIBE_SESSIONS[session_id] = session
+    return {"sessionId": session_id}
+
+
+async def _transcribe_stream_write_bytes(transport: Any, params: dict[str, Any]) -> Any:
+    """Writes a fixture in fixed-size chunks, with no decoding.
+
+    The neural fixture is already in the form the addon wants, so unlike the
+    audio writer this one does not touch the bytes -- which is the whole
+    difference between the two inputs.
+    """
+    session = _transcribe_session(params["sessionId"])
+    data = bytes(params["data"])
+    chunk_bytes = int(params["chunkBytes"])
+    chunks = 0
+    for offset in range(0, len(data), chunk_bytes):
+        session.write(data[offset : offset + chunk_bytes])
+        chunks += 1
+    return {"chunks": chunks, "bytes": len(data)}
 
 
 async def _transcribe_stream_end(transport: Any, params: dict[str, Any]) -> Any:
@@ -622,6 +659,8 @@ CALLS: dict[str, Callable[[Any, dict[str, Any]], Any]] = {
     "transcribeStreamOpen": _transcribe_stream_open,
     "transcribeStreamWrite": _transcribe_stream_write,
     "transcribeStreamWriteChunks": _transcribe_stream_write_chunks,
+    "bciTranscribeStreamOpen": _bci_transcribe_stream_open,
+    "transcribeStreamWriteBytes": _transcribe_stream_write_bytes,
     "transcribeStreamEnd": _transcribe_stream_end,
     "transcribeStreamDestroy": _transcribe_stream_destroy,
     # --- the harness's own surface ------------------------------------------

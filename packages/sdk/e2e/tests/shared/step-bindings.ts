@@ -7,6 +7,7 @@ import {
   audioUnderstand,
   batchCompletion,
   bciTranscribe,
+  bciTranscribeStream,
   cancel,
   classify,
   completion,
@@ -273,6 +274,38 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
       written++
     }
     return { chunks: written }
+  },
+
+  /**
+   * The BCI duplex session, in the same registry as the transcription ones.
+   *
+   * Its input is raw neural samples rather than audio, so it has its own open
+   * and its own write; everything after that -- end, drain, destroy -- is the
+   * same session surface.
+   */
+  bciTranscribeStreamOpen: async (params: never) => {
+    const session = (await bciTranscribeStream(params as never)) as unknown as TranscribeSession
+    const sessionId = `session-${++transcribeSessionSeq}`
+    TRANSCRIBE_SESSIONS.set(sessionId, session)
+    return { sessionId }
+  },
+
+  /**
+   * Writes a fixture in fixed-size chunks, with no decoding.
+   *
+   * The neural fixture is already in the form the addon wants, so unlike the
+   * audio writer this one does not touch the bytes -- which is the whole
+   * difference between the two inputs.
+   */
+  transcribeStreamWriteBytes: async (params: never) => {
+    const p = params as { sessionId: string; data: Uint8Array; chunkBytes: number }
+    const session = transcribeSession(p.sessionId)
+    let chunks = 0
+    for (let offset = 0; offset < p.data.byteLength; offset += p.chunkBytes) {
+      session.write(p.data.subarray(offset, offset + p.chunkBytes))
+      chunks++
+    }
+    return { chunks, bytes: p.data.byteLength }
   },
 
   transcribeStreamEnd: async (params: never) => {
