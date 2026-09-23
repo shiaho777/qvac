@@ -39,7 +39,7 @@ from .schemas import (
     BatchCompletionStreamRequest,
     DiffusionStreamRequest,
     OcrStreamRequest,
-    TextToSpeechStreamRequest,
+    TextToSpeechRequest,
     TranscribeStreamRequest,
     UpscaleStreamRequest,
     WorldSceneStreamRequest,
@@ -193,12 +193,6 @@ def _derive(
 def _decode(data: str | None) -> bytes:
     """Wire base64 -> the bytes JS hands back as a Uint8Array."""
     return base64.b64decode(data) if data else b""
-
-
-async def _closed_upstream() -> AsyncIterator[bytes]:
-    """An upstream with nothing in it, for a duplex call that sends no input."""
-    return
-    yield b""  # pragma: no cover - makes this an (empty) async generator
 
 
 def _base64(value: Any) -> Any:
@@ -414,10 +408,15 @@ def text_to_speech(
 ) -> TtsRun:
     """Synthesise speech. Mirrors JS's `textToSpeech()`."""
     resolved = request_id or generate_client_request_id()
-    request = TextToSpeechStreamRequest.model_validate(
+    # The server-stream request, not the duplex one. JS uses `streamRpc` for
+    # plain synthesis and `duplex` only for the interactive session; driving
+    # the duplex stub here ended the call before any audio arrived, so TTS
+    # came back with zero samples on every run. The interactive form is
+    # `sessions.text_to_speech_stream_session`.
+    request = TextToSpeechRequest.model_validate(
         _payload(
             None,
-            type="textToSpeechStream",
+            type="textToSpeech",
             modelId=model_id,
             requestId=resolved,
             **params,
@@ -435,13 +434,7 @@ def text_to_speech(
     # immediately -- without it the call raised TypeError before any audio was
     # asked for, which meant non-session TTS did not work from Python at all.
     # The interactive form is `sessions.text_to_speech_stream_session`.
-    _pump(
-        run,
-        transport,
-        request,
-        lambda t, r: _methods.text_to_speech_stream(t, r, _closed_upstream()),
-        items_of=samples,
-    )
+    _pump(run, transport, request, _methods.text_to_speech, items_of=samples)
     # The rate may never arrive on a failed or empty run; settle it with the
     # rest rather than leaving a caller awaiting it for ever.
     run.done.add_done_callback(
