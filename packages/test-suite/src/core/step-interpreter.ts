@@ -361,6 +361,21 @@ export class StepInterpreter {
         throw new StepError(`settle: "${step.settle.of}" is not a started call`)
       }
       const outcome = await handle[PENDING]
+      if (step.settle.expect === 'reject') {
+        if (!('error' in outcome)) {
+          throw new StepError(`${step.settle.of} was expected to fail but resolved`)
+        }
+        // Bound the way `callError` binds a rejection, so one body can assert
+        // on a refusal however the call that produced it was made.
+        const e = outcome.error as { code?: string | number; message?: string; cause?: unknown }
+        scope[step.settle.as ?? 'result'] = {
+          code: e.code === undefined ? '' : String(e.code),
+          message: e.message ?? String(outcome.error),
+          hasCause: e.cause !== undefined,
+          details: errorDetails(outcome.error)
+        }
+        return undefined
+      }
       if ('error' in outcome) throw outcome.error
       scope[step.settle.as ?? 'result'] = outcome.value
       return undefined

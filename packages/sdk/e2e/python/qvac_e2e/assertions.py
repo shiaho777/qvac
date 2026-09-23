@@ -82,6 +82,79 @@ def equals_joined(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(parts)} part(s) joined")
 
 
+def _frame_dimensions(data: bytes) -> tuple[int, int] | None:
+    """PNG IHDR or JPEG SOF0 dimensions, so both frame encodings are accepted.
+
+    The world session emits whichever its encoder produced, and a test about
+    the picture should not care which.
+    """
+    png = _png_dimensions(data)
+    if png is not None:
+        return png
+    if len(data) < 24 or data[0] != 0xFF or data[1] != 0xD8:
+        return None
+    offset = 2
+    while offset + 9 < len(data):
+        if data[offset] != 0xFF:
+            return None
+        marker = data[offset + 1]
+        length = int.from_bytes(data[offset + 2 : offset + 4], "big")
+        # SOF0..SOF3 -- baseline, extended, progressive and lossless. Excludes
+        # 0xC4 (DHT), which shares the 0xCn range but is not a frame header.
+        if 0xC0 <= marker <= 0xC3:
+            height = int.from_bytes(data[offset + 5 : offset + 7], "big")
+            width = int.from_bytes(data[offset + 7 : offset + 9], "big")
+            return width, height
+        offset += 2 + length
+    return None
+
+
+def frames_are(value: Any, args: dict[str, Any]) -> StepResult:
+    """A block of frames: this many, each at this size.
+
+    Both encodings are read, because which one the engine emits is its business
+    and the claim is about the picture. The count matters as much as the size:
+    the first block after a load is shorter than the ones after it, so a body
+    that only checked dimensions could not tell a fresh session from a
+    continuing one.
+    """
+    frames = value if isinstance(value, list) else []
+    expected = int(args.get("count", 0))
+    if len(frames) != expected:
+        return StepResult.fail(f"expected {expected} frame(s), got {len(frames)}")
+    width, height = int(args.get("width", 0)), int(args.get("height", 0))
+    for index, frame in enumerate(frames):
+        dims = _frame_dimensions(_as_bytes(frame))
+        if dims is None:
+            return StepResult.fail(f"frame {index} is undecodable")
+        if dims != (width, height):
+            return StepResult.fail(
+                f"frame {index} is {dims[0]}x{dims[1]}, expected {width}x{height}"
+            )
+    return StepResult.ok(f"{expected} frame(s) at {width}x{height}")
+
+
+def safetensors_container(value: Any, args: dict[str, Any]) -> StepResult:
+    """The bytes are a safetensors container.
+
+    A cheap structural read of the header, which is what tells a real pack from
+    an error page or a truncated write -- both of which are non-empty byte
+    arrays and would satisfy a length check.
+    """
+    data = _as_bytes(value)
+    floor = int(args.get("minBytes", 1024))
+    if len(data) < floor:
+        return StepResult.fail(f"pack is {len(data)} bytes, expected at least {floor}")
+    header_length = int.from_bytes(data[0:8], "little")
+    # A little-endian u64 header length, then that many bytes of JSON starting
+    # with '{'.
+    if header_length <= 0 or header_length + 8 > len(data) or data[8] != 0x7B:
+        return StepResult.fail(
+            f"not a safetensors container (header length {header_length})"
+        )
+    return StepResult.ok(f"{len(data)} bytes, header {header_length}")
+
+
 def no_progress_batch_gaps(value: Any, _args: dict[str, Any]) -> StepResult:
     """Every batch of every phase reported its progress, with no gaps.
 
@@ -1040,6 +1113,8 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "noPartialDownloads": no_partial_downloads,
     "anyElementPositive": any_element_positive,
     "noProgressBatchGaps": no_progress_batch_gaps,
+    "framesAre": frames_are,
+    "safetensorsContainer": safetensors_container,
     "atLeast": at_least,
     "isAbsent": is_absent,
     "belowBudget": below_budget,

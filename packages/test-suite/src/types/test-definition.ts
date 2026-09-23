@@ -123,7 +123,16 @@ export const stepSchema: z.ZodType<Step> = z.lazy(() =>
       .object({
         settle: z.object({
           of: z.string().describe('Reference to a call started by `start`, e.g. "$inflight"'),
-          as: z.string().optional().describe('Bind the resolved value under this name')
+          as: z.string().optional().describe('Bind the resolved value under this name'),
+          expect: z
+            .enum(['resolve', 'reject'])
+            .optional()
+            .describe(
+              'What the started call must do. The default is `resolve`. With `reject` the ' +
+                'rejection is bound the way `callError` binds one, and a call that resolved ' +
+                'instead fails the step -- which is what a cancellation test is about: an ' +
+                'accepted cancel must make the call reject rather than deliver a truncated result'
+            )
         })
       })
       .strict(),
@@ -246,7 +255,7 @@ export type Step =
         as: string
       }
     }
-  | { settle: { of: string; as?: string } }
+  | { settle: { of: string; as?: string; expect?: 'resolve' | 'reject' } }
   | { repeat: { over: string; as: string; collectInto: string; steps: Step[] } }
   | { project: { from: string; path: string; join?: string; count?: boolean; as: string } }
   | {

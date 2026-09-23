@@ -1663,6 +1663,20 @@ class Interpreter:
         if not isinstance(handle, _Pending):
             raise StepError(f'settle: "{body["of"]}" is not a started call')
         result = await handle.task
+        if body.get("expect") == "reject":
+            if "error" not in result:
+                raise StepError(f"{body['of']} was expected to fail but resolved")
+            # Bound the way `_call_error` binds a rejection, so one body can
+            # assert on a refusal however the call that produced it was made.
+            error = result["error"]
+            code = getattr(error, "code", None)
+            scope[body.get("as") or "result"] = {
+                "code": "" if code is None else str(code),
+                "message": str(error),
+                "hasCause": error.__cause__ is not None,
+                "details": _error_details(error),
+            }
+            return None
         if "error" in result:
             raise result["error"]
         scope[body.get("as") or "result"] = result["value"]

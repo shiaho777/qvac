@@ -403,6 +403,13 @@
             },
             "as": {
               "type": "string"
+            },
+            "expect": {
+              "enum": [
+                "resolve",
+                "reject"
+              ],
+              "description": "What the started call must do. The default is `resolve`. With `reject` the rejection is bound the way `callError` binds one, and a call that resolved instead fails the step."
             }
           }
         },

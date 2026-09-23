@@ -301,8 +301,16 @@ const CALLS: Record<string, (params: never) => Promise<unknown>> = {
 
   // --- world ---------------------------------------------------------------
   worldCreateScene: async (params: never) => {
-    const scene = worldCreateScene(params)
-    return { requestId: scene.requestId, stats: await scene.stats }
+    const run = worldCreateScene(params)
+    const p = params as { returnPack?: boolean }
+    // The pack is ~14 MB base64 on the wire, so only the test that asserts on
+    // it asks for it -- the walk tests just need the world live on the
+    // session, and `stats` is their completion signal.
+    return {
+      requestId: run.requestId,
+      stats: await run.stats,
+      ...(p.returnPack ? { scene: await run.scene } : {})
+    }
   }
 }
 
@@ -471,19 +479,36 @@ const STREAMS: Record<string, Fold> = {
     // filled by the run's own pump whether or not anyone iterates. Draining the
     // generator instead would double-buffer every image frame to arrive at the
     // identical value.
-    if (collect === 'all') return { all: await run.frames }
+    // `stats` rides along with every fold: the action mask and the step count
+    // are what a walk test is actually about, and a block takes long enough
+    // that asking for them through a second `collect` would mean walking
+    // twice.
+    if (collect === 'all') {
+      const frames = await run.frames
+      return { all: frames, frameCount: frames.length, stats: await run.stats }
+    }
     if (collect === 'last') {
       const frames = await run.frames
-      return { last: frames.at(-1), frameCount: frames.length }
+      return { last: frames.at(-1), frameCount: frames.length, stats: await run.stats }
     }
     if (collect === 'events') {
       const frames = await run.frames
-      return { events: await drain(run.progressStream), frameCount: frames.length }
+      return {
+        events: await drain(run.progressStream),
+        frameCount: frames.length,
+        stats: await run.stats
+      }
     }
     throw unsupported('worldStep', collect)
   },
 
   finetune: async (params, collect) => {
+    // A control operation -- pause, resume, stop -- is a plain call that
+    // resolves; only a run without one produces a handle with a progress
+    // stream and a result. Folding a control call as though it had a `result`
+    // awaited `undefined`, which resolves, so a refusal read as success.
+    const p = params as unknown as { operation?: string }
+    if (p.operation) return { last: await (finetune(params) as unknown as Promise<unknown>) }
     const handle = finetune(params)
     if (collect === 'events') {
       const events = await drain(handle.progressStream)
@@ -760,6 +785,44 @@ const vectorIndex = (indexId: string) => {
  */
 const scratchDirectories = new Set<string>()
 
+/** Is this path one of this run's scratch roots, or inside one? */
+const withinScratch = (candidate: string): boolean => {
+  const resolved = path.resolve(candidate)
+  for (const root of scratchDirectories) {
+    if (resolved === root || resolved.startsWith(root + path.sep)) return true
+  }
+  return false
+}
+
+/**
+ * PNG IHDR or JPEG SOF0 dimensions, so both frame encodings are accepted.
+ *
+ * The world session emits whichever its encoder produced, and a test about the
+ * picture should not care which.
+ */
+const readFrameDimensions = (bytes: Uint8Array): { width: number; height: number } | undefined => {
+  const png = readPngDimensions(bytes)
+  if (png) return png
+  if (bytes.byteLength < 24 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  let offset = 2
+  while (offset + 9 < bytes.byteLength) {
+    if (bytes[offset] !== 0xff) return undefined
+    const marker = bytes[offset + 1] as number
+    const length = view.getUint16(offset + 2, false)
+    // SOF0..SOF3 -- baseline, extended, progressive and lossless. Excludes
+    // 0xC4 (DHT), which shares the 0xCn range but is not a frame header.
+    if (marker >= 0xc0 && marker <= 0xc3) {
+      return {
+        width: view.getUint16(offset + 7, false),
+        height: view.getUint16(offset + 5, false)
+      }
+    }
+    offset += 2 + length
+  }
+  return undefined
+}
+
 /** How much data a value carries, whether it arrived as bytes or a list. */
 const byteLength = (value: unknown): number => {
   if (ArrayBuffer.isView(value)) return (value as Uint8Array).byteLength
@@ -979,6 +1042,64 @@ const ASSERTIONS: Record<
       return { passed: false, output: `expected ${expected} element(s), got ${value.length}` }
     }
     return { passed: true, output: `${value.length} element(s)` }
+  },
+
+  /**
+   * A block of frames: this many, each at this size.
+   *
+   * Both encodings are read, because which one the engine emits is its
+   * business and the claim is about the picture. The count matters as much as
+   * the size: the first block after a load is shorter than the ones after it,
+   * so a body that only checked dimensions could not tell a fresh session from
+   * a continuing one.
+   */
+  framesAre(value, args) {
+    const frames = (Array.isArray(value) ? value : []) as unknown[]
+    const expected = Number(args.count)
+    if (frames.length !== expected) {
+      return { passed: false, output: `expected ${expected} frame(s), got ${frames.length}` }
+    }
+    const [width, height] = [Number(args.width), Number(args.height)]
+    for (const [index, frame] of frames.entries()) {
+      const dims = readFrameDimensions(asBytes(frame))
+      if (!dims) return { passed: false, output: `frame ${index} is undecodable` }
+      if (dims.width !== width || dims.height !== height) {
+        return {
+          passed: false,
+          output: `frame ${index} is ${dims.width}x${dims.height}, expected ${width}x${height}`
+        }
+      }
+    }
+    return { passed: true, output: `${expected} frame(s) at ${width}x${height}` }
+  },
+
+  /**
+   * The bytes are a safetensors container.
+   *
+   * A cheap structural read of the header, which is what tells a real pack
+   * from an error page or a truncated write -- both of which are non-empty
+   * byte arrays and would satisfy a length check.
+   */
+  safetensorsContainer(value, args) {
+    const bytes = asBytes(value)
+    const floor = Number(args.minBytes ?? 1024)
+    if (bytes.byteLength < floor) {
+      return {
+        passed: false,
+        output: `pack is ${bytes.byteLength} bytes, expected at least ${floor}`
+      }
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    const headerLength = Number(view.getBigUint64(0, true))
+    // A little-endian u64 header length, then that many bytes of JSON starting
+    // with '{'.
+    if (headerLength <= 0 || headerLength + 8 > bytes.byteLength || bytes[8] !== 0x7b) {
+      return {
+        passed: false,
+        output: `not a safetensors container (header length ${headerLength})`
+      }
+    }
+    return { passed: true, output: `${bytes.byteLength} bytes, header ${headerLength}` }
   },
 
   /**
@@ -2150,17 +2271,23 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
        */
       if (method === 'scratchDirectory') {
         const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qvac-e2e-'))
-        for (const name of ((params as { subdirectories?: string[] }).subdirectories ??
-          []) as string[]) {
-          fs.mkdirSync(path.join(root, name), { recursive: true })
+        const names = ((params as { subdirectories?: string[] }).subdirectories ?? []) as string[]
+        const directories: Record<string, string> = {}
+        for (const name of names) {
+          const made = path.join(root, name)
+          directories[name] = made
+          fs.mkdirSync(made, { recursive: true })
         }
         scratchDirectories.add(root)
-        return { path: root }
+        // The subdirectory paths are handed back rather than joined in the
+        // catalog: a step names data, and building a path out of two bound
+        // values is not something it can do.
+        return { path: root, directories }
       }
       if (method === 'producedFile') {
         const p = params as { directory: string; file: string }
-        if (!scratchDirectories.has(p.directory)) {
-          throw new Error(`"${p.directory}" is not a directory this test created`)
+        if (!withinScratch(p.directory)) {
+          throw new Error(`"${p.directory}" is not inside a directory this test created`)
         }
         const target = path.join(p.directory, p.file)
         return { exists: fs.existsSync(target), path: target }
