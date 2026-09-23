@@ -267,13 +267,17 @@ const STREAMS: Record<string, Fold> = {
 
   worldStep: async (params, collect) => {
     const run = worldStep(params)
-    if (collect === 'all') return { all: await drain(run.frameStream) }
+    // `frames` is the same array the generator would hand back one at a time,
+    // filled by the run's own pump whether or not anyone iterates. Draining the
+    // generator instead would double-buffer every image frame to arrive at the
+    // identical value.
+    if (collect === 'all') return { all: await run.frames }
     if (collect === 'last') {
-      const frames = await drain(run.frameStream)
+      const frames = await run.frames
       return { last: frames.at(-1), frameCount: frames.length }
     }
     if (collect === 'events') {
-      const frames = await drain(run.frameStream)
+      const frames = await run.frames
       return { events: await drain(run.progressStream), frameCount: frames.length }
     }
     throw unsupported('worldStep', collect)
