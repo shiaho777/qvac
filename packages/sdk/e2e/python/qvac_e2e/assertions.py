@@ -67,6 +67,48 @@ def numbers_in_range(value: Any, args: dict[str, Any]) -> StepResult:
     return StepResult.ok(f"{len(items)} value(s) within [{low}, {high}]")
 
 
+def equals_joined(value: Any, args: dict[str, Any]) -> StepResult:
+    """The text is exactly the parts joined by the separator.
+
+    A batch translation returns both the entries and one text, and the claim is
+    that they are the same answer in two shapes rather than two answers.
+    """
+    parts = [str(part) for part in (args.get("parts") or [])]
+    expected = str(args.get("separator", "\n")).join(parts)
+    if value != expected:
+        return StepResult.fail(f"expected {expected!r}, got {value!r}")
+    return StepResult.ok(f"{len(parts)} part(s) joined")
+
+
+def any_field_present(value: Any, args: dict[str, Any]) -> StepResult:
+    """At least one of the named fields is present.
+
+    For the readings an engine may report in more than one shape: which timing
+    field a backend fills is its business, that it reported timing at all is
+    the claim.
+    """
+    record = value if isinstance(value, dict) else {}
+    fields = args.get("fields") or []
+    found = [field for field in fields if record.get(field) is not None]
+    if not found:
+        return StepResult.fail(f"none of {', '.join(fields)} are present")
+    return StepResult.ok(f"{', '.join(found)} present")
+
+
+def is_empty_text(value: Any, _args: dict[str, Any]) -> StepResult:
+    """The value has no text in it.
+
+    The empty-input tests: an empty prompt has nothing to translate, and the
+    claim is that the client says so rather than inventing output.
+    """
+    if value is not None and not isinstance(value, str):
+        return StepResult.fail(f"expected a string, got {type(value).__name__}")
+    text = value or ""
+    if text.strip():
+        return StepResult.fail(f"expected no text, got: {text[:120]}")
+    return StepResult.ok("(empty)")
+
+
 def sorted_descending_by(value: Any, args: dict[str, Any]) -> StepResult:
     """The list is ordered by the named field, largest first."""
     items = value if isinstance(value, list) else []
@@ -586,6 +628,9 @@ def loaded_model_info_shape(value: Any, args: dict[str, Any]) -> StepResult:
 ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "lengthIs": length_is,
     "lengthAtLeast": length_at_least,
+    "anyFieldPresent": any_field_present,
+    "equalsJoined": equals_joined,
+    "isEmptyText": is_empty_text,
     "numbersInRange": numbers_in_range,
     "sortedDescendingBy": sorted_descending_by,
     "sumsTo": sums_to,
@@ -607,4 +652,84 @@ ASSERTIONS: dict[str, Callable[[Any, dict[str, Any]], StepResult]] = {
     "valueIn": value_in,
     "fieldEquals": field_equals,
     "loadedModelInfoShape": loaded_model_info_shape,
+}
+
+
+def _byte_length(value: Any) -> int:
+    """How much data a value carries, whether it arrived as bytes or a list."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(bytes(value))
+    if isinstance(value, list):
+        return len(value)
+    return 0
+
+
+def _as_bytes(value: Any) -> bytes:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, list):
+        return bytes(bytearray(int(item) & 0xFF for item in value))
+    return b""
+
+
+def identical_bytes(left: Any, right: Any, _args: dict[str, Any]) -> StepResult:
+    """The two runs produced exactly the same data.
+
+    The determinism half of a conditioning test: the same inputs twice have to
+    give the same output before "changing this one input changed the output"
+    means anything.
+    """
+    if _as_bytes(left) != _as_bytes(right):
+        return StepResult.fail(
+            f"expected identical output, got {_byte_length(left)} "
+            f"and {_byte_length(right)} byte(s) that differ"
+        )
+    return StepResult.ok(f"identical, {_byte_length(left)} byte(s)")
+
+
+def different_bytes(left: Any, right: Any, _args: dict[str, Any]) -> StepResult:
+    """The two runs produced different data, and both produced some.
+
+    Both halves matter: two empty results are trivially different, and a
+    conditioning test that accepted them would pass against a silent engine.
+    """
+    if _byte_length(left) == 0 or _byte_length(right) == 0:
+        return StepResult.fail(
+            f"one side produced nothing ({_byte_length(left)} and "
+            f"{_byte_length(right)} byte(s))"
+        )
+    if _as_bytes(left) == _as_bytes(right):
+        return StepResult.fail("expected the outputs to differ, they are identical")
+    return StepResult.ok(
+        f"differ, {_byte_length(left)} vs {_byte_length(right)} byte(s)"
+    )
+
+
+def length_ratio_at_least(left: Any, right: Any, args: dict[str, Any]) -> StepResult:
+    """The left value carries at least this many times the data of the right.
+
+    The strongest claim available about an output sample rate: the rate itself
+    is not exposed through the public result, but a native-rate run has to
+    produce proportionally more samples than a downsampled one.
+    """
+    left_size, right_size = _byte_length(left), _byte_length(right)
+    if left_size == 0 or right_size == 0:
+        return StepResult.fail(
+            f"comparison produced empty output ({left_size} and {right_size})"
+        )
+    minimum = float(args.get("ratio", 1))
+    ratio = left_size / right_size
+    if ratio < minimum:
+        return StepResult.fail(
+            f"ratio too low: {ratio:.2f} < {minimum} ({left_size} vs {right_size})"
+        )
+    return StepResult.ok(f"ratio {ratio:.2f} ({left_size} vs {right_size})")
+
+
+#: Checks that take two bound values rather than one. Kept beside the
+#: assertions so both clients read one list.
+COMPARISONS: dict[str, Any] = {
+    "identicalBytes": identical_bytes,
+    "differentBytes": different_bytes,
+    "lengthRatioAtLeast": length_ratio_at_least,
 }

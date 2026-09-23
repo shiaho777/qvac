@@ -81,10 +81,37 @@ export const indictransEnHiNumbers = createIndicTransTest(
   { validation: 'type', expectedType: 'string' }
 )
 
+/**
+ * An empty input is refused, not translated.
+ *
+ * The executor accepted either an empty result or a rejection, so it never
+ * said which one happens. Migrating it answered the question: the client's own
+ * request validation rejects `text: ""` before anything reaches the worker.
+ * Written as the rejection it is, so a client that started translating empty
+ * input instead would fail here.
+ */
 export const indictransEnHiEmptyText: TestDefinition = {
   testId: 'translation-indictrans-en-hi-empty-text',
   params: { text: '', resource: 'indictrans-en-hi' },
-  expectation: { validation: 'type', expectedType: 'string' },
+  expectation: { validation: 'throws-error', errorContains: 'Text cannot be empty' },
+  steps: [
+    { useModel: { deps: ['indictrans-en-hi'], as: 'model' } },
+    {
+      callError: {
+        method: 'translate',
+        collect: 'text',
+        params: {
+          modelId: '$model',
+          text: '$params.text',
+          modelType: 'nmtcpp-translation',
+          stream: false
+        },
+        as: 'err'
+      }
+    },
+    { project: { from: '$err', path: 'message', as: 'message' } },
+    { assert: { on: '$message', use: 'expectation' } }
+  ],
   metadata: {
     category: 'translation-indictrans',
     dependency: 'indictrans-en-hi',

@@ -24,6 +24,49 @@ const nmtSteps = (dependency: string): Step[] => [
   { assert: { on: '$text', use: 'expectation' } }
 ]
 
+/**
+ * A batch NMT translation: several inputs in one call.
+ *
+ * Three checks, because the executor made three claims: one entry per input,
+ * none of them empty, and the run's `text` is exactly those entries joined --
+ * the same answer in two shapes rather than two answers.
+ */
+const nmtBatchSteps = (count: number): Step[] => [
+  { useModel: { deps: ['bergamot-en-fr'], as: 'model' } },
+  {
+    call: {
+      method: 'translate',
+      collect: 'text',
+      params: {
+        modelId: '$model',
+        text: '$params.texts',
+        modelType: 'nmtcpp-translation',
+        stream: false
+      },
+      as: 'run'
+    }
+  },
+  { project: { from: '$run', path: 'translations', as: 'translations' } },
+  { assert: { on: '$translations', named: 'lengthIs', with: { length: count } } },
+  {
+    repeat: {
+      over: '$translations',
+      as: 'entry',
+      collectInto: 'checked',
+      steps: [{ assert: { on: '$entry', named: 'nonEmptyText' } }]
+    }
+  },
+  { project: { from: '$run', path: 'text', as: 'text' } },
+  {
+    assert: {
+      on: '$text',
+      named: 'equalsJoined',
+      with: { parts: '$translations', separator: '\n' }
+    }
+  },
+  { assert: { on: '$text', use: 'expectation' } }
+]
+
 const createBergamotTest = (
   testId: string,
   text: string,
@@ -87,10 +130,37 @@ export const bergamotEnFrNumbers = createBergamotTest(
   { validation: 'contains-any', contains: ['réunion', '10', '25', 'participant'] }
 )
 
+/**
+ * An empty input is refused, not translated.
+ *
+ * The executor accepted either an empty result or a rejection, so it never
+ * said which one happens. Migrating it answered the question: the client's own
+ * request validation rejects `text: ""` before anything reaches the worker.
+ * Written as the rejection it is, so a client that started translating empty
+ * input instead would fail here.
+ */
 export const bergamotEnFrEmptyText: TestDefinition = {
   testId: 'translation-bergamot-en-fr-empty-text',
   params: { text: '', resource: 'bergamot-en-fr' },
-  expectation: { validation: 'type', expectedType: 'string' },
+  expectation: { validation: 'throws-error', errorContains: 'Text cannot be empty' },
+  steps: [
+    { useModel: { deps: ['bergamot-en-fr'], as: 'model' } },
+    {
+      callError: {
+        method: 'translate',
+        collect: 'text',
+        params: {
+          modelId: '$model',
+          text: '$params.text',
+          modelType: 'nmtcpp-translation',
+          stream: false
+        },
+        as: 'err'
+      }
+    },
+    { project: { from: '$err', path: 'message', as: 'message' } },
+    { assert: { on: '$message', use: 'expectation' } }
+  ],
   metadata: {
     category: 'translation-bergamot',
     dependency: 'bergamot-en-fr',
@@ -118,6 +188,7 @@ export const bergamotEnFrBatchBasic: TestDefinition = {
   testId: 'translation-bergamot-en-fr-batch-basic',
   params: { texts: ['Good morning', 'Good night'], resource: 'bergamot-en-fr' },
   expectation: { validation: 'contains-any', contains: ['bonjour', 'matin', 'nuit', 'bonne'] },
+  steps: nmtBatchSteps(2),
   metadata: {
     category: 'translation-bergamot',
     dependency: 'bergamot-en-fr',
@@ -132,6 +203,7 @@ export const bergamotEnFrBatchMultiple: TestDefinition = {
     resource: 'bergamot-en-fr'
   },
   expectation: { validation: 'contains-any', contains: ['comment', 'temps', 'merci', 'revoir'] },
+  steps: nmtBatchSteps(4),
   metadata: {
     category: 'translation-bergamot',
     dependency: 'bergamot-en-fr',
@@ -146,6 +218,7 @@ export const bergamotEnFrBatchArray: TestDefinition = {
     resource: 'bergamot-en-fr'
   },
   expectation: { validation: 'contains-any', contains: ['bonjour', 'matin', 'temps', 'merci'] },
+  steps: nmtBatchSteps(3),
   metadata: {
     category: 'translation-bergamot',
     dependency: 'bergamot-en-fr',

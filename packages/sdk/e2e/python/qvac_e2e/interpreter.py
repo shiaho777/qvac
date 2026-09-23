@@ -80,7 +80,7 @@ from tetherto.qvac_sdk import (
     vla_set_embodiment,
 )
 
-from .assertions import ASSERTIONS
+from .assertions import ASSERTIONS, COMPARISONS
 from .resources import ASSET_ROOT, ResourceManager, UnknownResourceError
 from .result import StepResult
 from .validation import validate
@@ -285,7 +285,7 @@ async def _completion_stream(
 async def _translate_stream(
     transport: Any, params: dict[str, Any], collect: str
 ) -> Any:
-    if collect != "text":
+    if collect not in ("text", "all"):
         raise StepError(
             f'collect: "{collect}" is not defined for translate', incomplete=True
         )
@@ -300,14 +300,31 @@ async def _translate_stream(
         stream=stream,
         context=params.get("context"),
     )
+    if collect == "all":
+        # `all` carries the joined text beside the tokens: "it streamed, and
+        # this is what it said" is one question, and a second fold would be a
+        # second translation.
+        tokens = [token async for token in run.token_stream]
+        return {
+            "all": tokens,
+            "text": "".join(tokens),
+            "stats": _jsonable(await run.stats),
+        }
     if not stream:
-        return {"text": await run.text}
+        # `translations` rides along: a batch asks about the entries and about
+        # the text they join to, and a second fold would be a second
+        # translation.
+        return {
+            "text": await run.text,
+            "translations": await run.translations,
+            "stats": _jsonable(await run.stats),
+        }
     # `text` resolves to the empty string in streaming mode on both clients, so
     # the fold has to follow the mode rather than always await the same handle.
     text = ""
     async for token in run.token_stream:
         text += token
-    return {"text": text}
+    return {"text": text, "stats": _jsonable(await run.stats)}
 
 
 async def _ocr_stream(transport: Any, params: dict[str, Any], collect: str) -> Any:
@@ -676,9 +693,7 @@ def _synthesize_bytes(spec: str) -> bytes:
     try:
         return bytes.fromhex(spec)
     except ValueError as error:
-        raise StepError(
-            f'bytes "{spec}" is not an even-length hex string'
-        ) from error
+        raise StepError(f'bytes "{spec}" is not an even-length hex string') from error
 
 
 def _synthesize_tone(spec: str) -> bytes:
@@ -867,11 +882,32 @@ class Interpreter:
             return self._project(body, scope)
         if op == "assert":
             return self._assert(body, scope, expectation)
+        if op == "compare":
+            return self._compare(body, scope)
 
         raise StepError(
             f'step operation "{op}" is not implemented by the Python interpreter yet',
             incomplete=True,
         )
+
+    def _compare(self, body: dict[str, Any], scope: dict[str, Any]) -> StepResult:
+        """Check two bound values against each other.
+
+        Distinct from `assert` because the question is about the relationship:
+        the same call made twice with one parameter changed, and the claim is
+        that the results differ -- or do not.
+        """
+        named = body["named"]
+        comparison = COMPARISONS.get(named)
+        if comparison is None:
+            raise StepError(
+                f'named comparison "{named}" is not in the Python registry',
+                incomplete=True,
+            )
+        left = self._resolve(body["left"], scope)
+        right = self._resolve(body["right"], scope)
+        args = self._resolve(body.get("with") or {}, scope)
+        return comparison(left, right, args)
 
     async def _call_error(self, body: dict[str, Any], scope: dict[str, Any]) -> None:
         """A call expected to fail. Binds { code, message }.

@@ -185,12 +185,20 @@ const STREAMS: Record<string, Fold> = {
   translate: async (params, collect) => {
     const p = params as unknown as { stream?: boolean }
     const run = translate(params)
-    if (collect === 'all') return { all: await drain(run.tokenStream) }
+    // `all` carries the joined text beside the tokens: "it streamed, and this
+    // is what it said" is one question, and a second fold would be a second
+    // translation.
+    if (collect === 'all') {
+      const all = await drain(run.tokenStream)
+      return { all, text: all.join(''), stats: await run.stats }
+    }
     if (collect !== 'text') throw unsupported('translate', collect)
     // `text` resolves to the empty string in streaming mode on both clients, so
     // the fold has to follow the mode rather than always await the same handle.
-    if (!p.stream) return { text: await run.text }
-    return { text: await joinStream(run.tokenStream) }
+    if (p.stream) return { text: await joinStream(run.tokenStream), stats: await run.stats }
+    // `translations` rides along: a batch asks about the entries and about the
+    // text they join to, and a second fold would be a second translation.
+    return { text: await run.text, translations: await run.translations, stats: await run.stats }
   },
 
   transcribeStream: async (params, collect) => {
@@ -449,6 +457,115 @@ const ASSET_ROOTS: Record<string, string> = {
   neural: 'assets/neural'
 }
 
+/** How much data a value carries, whether it arrived as bytes or a list. */
+const byteLength = (value: unknown): number => {
+  if (ArrayBuffer.isView(value)) return (value as Uint8Array).byteLength
+  if (Array.isArray(value)) return value.length
+  return 0
+}
+
+const asBytes = (value: unknown): Uint8Array => {
+  if (value instanceof Uint8Array) return value
+  if (ArrayBuffer.isView(value)) {
+    const view = value as ArrayBufferView
+    return new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
+  }
+  if (Array.isArray(value)) return Uint8Array.from(value.map((item) => Number(item) & 0xff))
+  return new Uint8Array()
+}
+
+const sameBytes = (left: unknown, right: unknown): boolean => {
+  const a = asBytes(left)
+  const b = asBytes(right)
+  if (a.byteLength !== b.byteLength) return false
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
+/**
+ * Checks that take two bound values rather than one.
+ *
+ * Distinct from the assertions because the question is about the
+ * relationship: the same call made twice with one parameter changed, and the
+ * claim is that the results differ -- or do not.
+ */
+const COMPARISONS: Record<
+  string,
+  (
+    left: unknown,
+    right: unknown,
+    args: Record<string, unknown>
+  ) => {
+    passed: boolean
+    output: string
+  }
+> = {
+  /**
+   * The two runs produced exactly the same data.
+   *
+   * The determinism half of a conditioning test: the same inputs twice have to
+   * give the same output before "changing this one input changed the output"
+   * means anything.
+   */
+  identicalBytes(left, right) {
+    if (!sameBytes(left, right)) {
+      return {
+        passed: false,
+        output: `expected identical output, got ${byteLength(left)} and ${byteLength(right)} byte(s) that differ`
+      }
+    }
+    return { passed: true, output: `identical, ${byteLength(left)} byte(s)` }
+  },
+
+  /**
+   * The two runs produced different data, and both produced some.
+   *
+   * Both halves matter: two empty results are trivially different, and a
+   * conditioning test that accepted them would pass against a silent engine.
+   */
+  differentBytes(left, right) {
+    if (byteLength(left) === 0 || byteLength(right) === 0) {
+      return {
+        passed: false,
+        output: `one side produced nothing (${byteLength(left)} and ${byteLength(right)} byte(s))`
+      }
+    }
+    if (sameBytes(left, right)) {
+      return { passed: false, output: 'expected the outputs to differ, they are identical' }
+    }
+    return {
+      passed: true,
+      output: `differ, ${byteLength(left)} vs ${byteLength(right)} byte(s)`
+    }
+  },
+
+  /**
+   * The left value carries at least this many times the data of the right.
+   *
+   * The strongest claim available about an output sample rate: the rate itself
+   * is not exposed through the public result, but a native-rate run has to
+   * produce proportionally more samples than a downsampled one.
+   */
+  lengthRatioAtLeast(left, right, args) {
+    const [leftSize, rightSize] = [byteLength(left), byteLength(right)]
+    if (leftSize === 0 || rightSize === 0) {
+      return {
+        passed: false,
+        output: `comparison produced empty output (${leftSize} and ${rightSize})`
+      }
+    }
+    const minimum = Number(args.ratio ?? 1)
+    const ratio = leftSize / rightSize
+    if (ratio < minimum) {
+      return {
+        passed: false,
+        output: `ratio too low: ${ratio.toFixed(2)} < ${minimum} (${leftSize} vs ${rightSize})`
+      }
+    }
+    return { passed: true, output: `ratio ${ratio.toFixed(2)} (${leftSize} vs ${rightSize})` }
+  }
+}
+
 /**
  * Named assertions: the checks that are more than "contains this string".
  *
@@ -522,6 +639,22 @@ const ASSERTIONS: Record<
       }
     }
     return { passed: true, output: `${items.length} value(s) within [${min}, ${max}]` }
+  },
+
+  /**
+   * The value has no text in it.
+   *
+   * The empty-input tests: an empty prompt has nothing to translate, and the
+   * claim is that the client says so rather than inventing output.
+   */
+  isEmptyText(value) {
+    const text = typeof value === 'string' ? value : ''
+    if (value !== undefined && value !== null && typeof value !== 'string') {
+      return { passed: false, output: `expected a string, got ${typeof value}` }
+    }
+    return text.trim().length === 0
+      ? { passed: true, output: '(empty)' }
+      : { passed: false, output: `expected no text, got: ${text.slice(0, 120)}` }
   },
 
   /** The list is ordered by the named field, largest first. */
@@ -767,6 +900,41 @@ const ASSERTIONS: Record<
       return { passed: false, output: `missing fields: ${missing.join(', ')}` }
     }
     return { passed: true, output: `${fields.length} field(s) present` }
+  },
+
+  /**
+   * The text is exactly the parts joined by the separator.
+   *
+   * A batch translation returns both the entries and one text, and the claim
+   * is that they are the same answer in two shapes rather than two answers.
+   */
+  equalsJoined(value, args) {
+    const parts = ((args.parts ?? []) as unknown[]).map(String)
+    const expected = parts.join(String(args.separator ?? '\n'))
+    if (value !== expected) {
+      return {
+        passed: false,
+        output: `expected ${JSON.stringify(expected)}, got ${JSON.stringify(value)}`
+      }
+    }
+    return { passed: true, output: `${parts.length} part(s) joined` }
+  },
+
+  /**
+   * At least one of the named fields is present.
+   *
+   * For the readings an engine may report in more than one shape: which timing
+   * field a backend fills is its business, that it reported timing at all is
+   * the claim.
+   */
+  anyFieldPresent(value, args) {
+    const record = (value ?? {}) as Record<string, unknown>
+    const fields = (args.fields ?? []) as string[]
+    const found = fields.filter((field) => record[field] !== undefined)
+    if (found.length === 0) {
+      return { passed: false, output: `none of ${fields.join(', ')} are present` }
+    }
+    return { passed: true, output: `${found.join(', ')} present` }
   },
 
   /**
@@ -1157,6 +1325,8 @@ export function createStepBindings(resources: ResourceManager): StepBindings {
     },
 
     assertions: ASSERTIONS,
+
+    comparisons: COMPARISONS,
 
     async evictAllExcept(keep) {
       await resources.evictExcept([...keep])

@@ -29,9 +29,9 @@ from typing import Any, Generic, TypeVar
 
 from ._api import generate_client_request_id
 from ._completion import _fold_events
-from .errors import CompletionFailedError
 from ._generated import methods as _methods
 from ._transport import Transport
+from .errors import CompletionFailedError
 from .schemas import (
     AudioEditStreamRequest,
     AudioGenStreamRequest,

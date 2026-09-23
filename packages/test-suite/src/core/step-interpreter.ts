@@ -58,7 +58,10 @@ export interface StepBindings {
   assertions?: Record<string, (value: unknown, args: Record<string, unknown>) => TestResult>
 
   /** Comparisons between two bound values, e.g. for a repeat-then-compare test. */
-  comparisons?: Record<string, (left: unknown, right: unknown) => TestResult>
+  comparisons?: Record<
+    string,
+    (left: unknown, right: unknown, args: Record<string, unknown>) => TestResult
+  >
 
   /** Evict everything not in `keep` before a test runs. */
   evictAllExcept?(keep: Set<string>): Promise<void>
@@ -452,7 +455,8 @@ export class StepInterpreter {
       }
       return comparison(
         this.resolve(step.compare.left, scope),
-        this.resolve(step.compare.right, scope)
+        this.resolve(step.compare.right, scope),
+        (this.resolve(step.compare.with ?? {}, scope) ?? {}) as Record<string, unknown>
       )
     }
 

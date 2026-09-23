@@ -31,15 +31,65 @@ const ttsSteps = (dependency: string, minSamples = 1): Step[] => [
 
 /**
  * Tests whose body compares two runs against each other -- a sample rate
- * against another sample rate, an emotion against its neutral baseline. One
- * call is not what they are about, so they keep their hand-written bodies.
+ * against another sample rate, an emotion against the same emotion. One call
+ * is not what they are about, so they carry their own bodies below.
+ *
+ * `tts-supertonic-enhanced` is not among them despite its name: the executor
+ * ran one synthesis and checked it produced audio, so it takes the ordinary
+ * body.
  */
 const TTS_COMPARISONS = new Set([
   'tts-supertonic-output-sample-rate',
-  'tts-supertonic-enhanced',
   'tts-parler-emotion-conditioning',
   'tts-cosyvoice3-emotion-conditioning'
 ])
+
+/** One synthesis, conditioned the way the caller asks, bound under `as`. */
+const synthesize = (model: string, as: string, extra: Record<string, unknown> = {}): Step[] => [
+  {
+    call: {
+      method: 'textToSpeech',
+      collect: 'pcm',
+      params: {
+        modelId: model,
+        text: '$params.text',
+        inputType: 'text',
+        stream: false,
+        ...extra
+      },
+      as: `${as}Run`
+    }
+  },
+  { project: { from: `$${as}Run`, path: 'pcm', as } }
+]
+
+/**
+ * Conditioning changed the audio, and only because of the conditioning.
+ *
+ * Three syntheses: the same request twice, then one with the conditioning
+ * changed. The control pair has to come back identical before "this parameter
+ * changed the output" means anything -- without it a non-deterministic engine
+ * would pass the test by being noisy.
+ */
+const emotionConditioningSteps = (dependency: string, voice?: string): Step[] => [
+  { useModel: { deps: [dependency], as: 'model' } },
+  ...synthesize('$model', 'first', {
+    emotion: '$params.firstEmotion',
+    ...(voice ? { voice: '$params.voice' } : {})
+  }),
+  ...synthesize('$model', 'control', {
+    emotion: '$params.firstEmotion',
+    ...(voice ? { voice: '$params.voice' } : {})
+  }),
+  ...synthesize('$model', 'second', {
+    emotion: '$params.secondEmotion',
+    ...(voice ? { voice: '$params.voice' } : {})
+  }),
+  { assert: { on: '$first', named: 'producedAudio', with: { minSamples: 1 } } },
+  { assert: { on: '$second', named: 'producedAudio', with: { minSamples: 1 } } },
+  { compare: { left: '$first', right: '$control', named: 'identicalBytes' } },
+  { compare: { left: '$first', right: '$second', named: 'differentBytes' } }
+]
 
 export const ttsChatterboxShortText: TestDefinition = {
   testId: 'tts-chatterbox-short-text',
@@ -143,6 +193,24 @@ export const ttsSupertonicSentenceStream: TestDefinition = {
 // relative sample-count comparison is the strongest available assertion.
 export const ttsSupertonicOutputSampleRate: TestDefinition = {
   testId: 'tts-supertonic-output-sample-rate',
+  // The two resources are declared together so the eviction guard keeps both
+  // for the run; `$models[0]` is the native rate, `$models[1]` the 8 kHz one.
+  steps: [
+    { useModel: { deps: ['tts-supertonic', 'tts-supertonic-8k'], as: 'models' } },
+    ...synthesize('$models[0]', 'native'),
+    ...synthesize('$models[1]', 'down'),
+    {
+      compare: {
+        left: '$native',
+        right: '$down',
+        named: 'lengthRatioAtLeast',
+        // Sample count scales with the rate, so 44.1 kHz against 8 kHz is
+        // about 5.5x. The 3x floor clears per-load duration jitter while
+        // still proving the resample took effect.
+        with: { ratio: 3 }
+      }
+    }
+  ],
   params: {
     text: 'This is a test of the output sample rate configuration for speech synthesis.',
     stream: false
@@ -181,6 +249,7 @@ export const ttsSupertonicEnhanced: TestDefinition = {
 // then verifies changing only the emotion produces different non-empty PCM.
 export const ttsParlerEmotionConditioning: TestDefinition = {
   testId: 'tts-parler-emotion-conditioning',
+  steps: emotionConditioningSteps('tts-parler', 'voice'),
   params: {
     text: 'Today is a wonderful day.',
     voice: 'Laura',
@@ -285,6 +354,7 @@ export const ttsParlerInvalidEmotion: TestDefinition = {
 // different non-empty PCM.
 export const ttsCosyvoice3EmotionConditioning: TestDefinition = {
   testId: 'tts-cosyvoice3-emotion-conditioning',
+  steps: emotionConditioningSteps('tts-cosyvoice3'),
   params: {
     text: 'Today is a wonderful day.',
     firstEmotion: 'happy',

@@ -203,7 +203,8 @@ async def load_model(
 class TranslateRun:
     """Handles for one translate() call, mirroring the JS return shape:
     `token_stream` (live tokens; empty in non-stream mode), `text` (awaitable
-    full text; resolves to "" in stream mode), and `stats` (awaitable,
+    full text; resolves to "" in stream mode), `translations` (one entry per
+    input when `text` was a list, one entry otherwise), and `stats` (awaitable,
     resolved when the terminal done chunk arrives -- in stream mode that
     means once `token_stream` has been consumed to the end). `request_id` is the
     client-generated id threaded on the wire, exposed for `cancel(request_id=...)`,
@@ -215,11 +216,17 @@ class TranslateRun:
         text: asyncio.Future[str],
         stats: asyncio.Future[Any],
         request_id: str,
+        translations: asyncio.Future[list[str]] | None = None,
     ) -> None:
         self.token_stream = token_stream
         self.text = text
         self.stats = stats
         self.request_id = request_id
+        if translations is None:
+            loop = asyncio.get_running_loop()
+            translations = loop.create_future()
+            translations.set_result([])
+        self.translations = translations
 
 
 def translate(
@@ -298,24 +305,39 @@ def translate(
         return
         yield  # pragma: no cover -- makes this an (empty) async generator
 
-    async def collect_text() -> str:
-        buffer = ""
+    # A batch sends a list and gets one token per input back; a single input
+    # gets its text in pieces. JS splits on exactly this and returns
+    # `translations` either way, with `text` as their newline join -- without
+    # the same split here a batch would come back as one run-together string.
+    batched = isinstance(text, list)
+
+    async def collect_translations() -> list[str]:
+        collected: list[str] = [] if batched else [""]
         async for chunk in transport.call_stream(wire):
             if chunk.get("type") != "translate":
                 continue
             response = TranslateResponse.model_validate(chunk)
-            buffer += response.token
             if response.done:
                 _finish_stats(response)
-        return buffer
+            elif batched:
+                collected.append(response.token)
+            else:
+                collected[0] += response.token
+        return collected
 
     # Eager task, matching the JS promise: the wire call starts now, not
     # when `text` is first awaited.
+    translations_task = loop.create_task(collect_translations())
+
+    async def joined() -> str:
+        return "\n".join(await translations_task)
+
     return TranslateRun(
         empty_stream(),
-        loop.create_task(collect_text()),
+        loop.create_task(joined()),
         stats_future,
         resolved_request_id,
+        translations_task,
     )
 
 

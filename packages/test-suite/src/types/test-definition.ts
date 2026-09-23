@@ -195,7 +195,15 @@ export const stepSchema: z.ZodType<Step> = z.lazy(() =>
         compare: z.object({
           left: z.string(),
           right: z.string(),
-          named: z.string().describe('Name of a shared comparison in the registry')
+          named: z.string().describe('Name of a shared comparison in the registry'),
+          with: z
+            .record(z.any())
+            .optional()
+            .describe(
+              'Arguments for the comparison, the way `assert` passes them. A threshold ' +
+                'belongs to the test, not to the registry: "one run produced at least three ' +
+                'times the samples of the other" is the same comparison at a different bound'
+            )
         })
       })
       .strict()
@@ -241,7 +249,9 @@ export type Step =
         with?: Record<string, unknown>
       }
     }
-  | { compare: { left: string; right: string; named: string } }
+  | {
+      compare: { left: string; right: string; named: string; with?: Record<string, unknown> }
+    }
 
 /**
  * Test definition schema
