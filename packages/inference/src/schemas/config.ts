@@ -125,7 +125,7 @@ export const qvacConfigSchema = z.object({
    * initializes. Raise this on slow storage or embedded hardware where the first
    * worker start (native addon load) legitimately exceeds the default.
    * The `QVAC_RPC_INIT_TIMEOUT_MS` environment variable takes precedence.
-   * Defaults to 30000 (30 seconds), or 120000 on Windows.
+   * Defaults to 30000 (30 seconds).
    */
   rpcInitTimeoutMs: z.number().int().positive().optional(),
 
