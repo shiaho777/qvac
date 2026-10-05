@@ -1,6 +1,7 @@
 import ImgStableDiffusion, {
   EsrganUpscaler,
   VideoStableDiffusion,
+  assessFit as diffusionAssessFit,
   type DiffusionFiles,
   type EsrganUpscalerConfig,
   type SdConfig,
@@ -107,6 +108,7 @@ export const diffusionPlugin = definePlugin({
   displayName: 'Image Generation & Upscaling (stable-diffusion.cpp)',
   addonPackage: ADDON_DIFFUSION,
   loadConfigSchema: sdcppConfigSchema,
+  assessFit: diffusionAssessFit,
 
   async resolveConfig(
     cfg: SdcppConfig,
@@ -182,7 +184,11 @@ export const diffusionPlugin = definePlugin({
         'main-gpu': 'world.backend',
         backend: 'world.backend',
         threads: 'world.threads',
-        offload_to_cpu: 'world.offloadParamsToCpu'
+        offload_to_cpu: 'world.offloadParamsToCpu',
+        params_backend: 'world.paramsBackend',
+        max_vram: 'world.maxVram',
+        stream_layers: 'world.streamLayers',
+        verbosity: 'world.verbosity'
       }
       const unsupported = Object.keys(cfg).filter(
         (key) => !worldSupported.has(key) && cfg[key as keyof typeof cfg] !== undefined

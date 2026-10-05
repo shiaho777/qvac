@@ -1,3 +1,4 @@
+import { RpcServerExecutor } from '../shared/executors/rpc-server-executor.js'
 import { Platform } from 'react-native'
 import { createExecutor, SkipExecutor } from '@qvac/test-suite/mobile'
 import type { TestDefinition } from '@qvac/test-suite'
@@ -36,7 +37,15 @@ import {
   PARAKEET_EOU_120M_V1_Q4_0,
   VISIONPSY_NANO_460M_MULTIMODAL_Q4_K_M,
   MMPROJ_VISIONPSY_NANO_460M_MULTIMODAL_Q8_0,
-  SMOLVLA_LIBERO_VISION_Q8
+  SMOLVLA_LIBERO_VISION_Q8,
+  BCI_WINDOWED,
+  FLUX_2_KLEIN_4B_Q4_0,
+  FLUX_2_KLEIN_4B_VAE,
+  QWEN3_4B_Q4_K_M,
+  AUDIOGEN_QWEN3_EMBEDDING_0_6B_Q8_0,
+  AUDIOGEN_ACESTEP_5HZ_LM_0_6B_Q8_0,
+  AUDIOGEN_ACESTEP_V15_TURBO_Q4_K_M,
+  AUDIOGEN_VAE_BF16
 } from '@qvac/sdk'
 import { ResourceManager } from '../shared/resource-manager.js'
 import { collectTestDeps } from '../shared/collect-test-deps.js'
@@ -46,6 +55,7 @@ import { ModelLoadingExecutor } from '../shared/executors/model-loading-executor
 import { CompletionExecutor } from '../shared/executors/completion-executor.js'
 import { EmbeddingExecutor } from '../shared/executors/embedding-executor.js'
 import { ToolsExecutor } from '../shared/executors/tools-executor.js'
+import { DeferredToolsExecutor } from '../shared/executors/deferred-tools-executor.js'
 import { TranslationExecutor } from '../shared/executors/translation-executor.js'
 import { ShardedModelExecutor } from '../shared/executors/sharded-model-executor.js'
 import { HttpEmbeddingExecutor } from '../shared/executors/http-embedding-executor.js'
@@ -53,6 +63,7 @@ import { KvCacheExecutor } from '../shared/executors/kv-cache-executor.js'
 import { MobileLoggingExecutor } from './executors/logging-executor.js'
 import { RegistryExecutor } from '../shared/executors/registry-executor.js'
 import { ModelInfoExecutor } from '../shared/executors/model-info-executor.js'
+import { ModelFitExecutor } from '../shared/executors/model-fit-executor.js'
 import { WrongModelExecutor } from '../shared/executors/wrong-model-executor.js'
 import { ErrorExecutor } from '../shared/executors/error-executor.js'
 import { MobileTranscriptionExecutor } from './executors/transcription-executor.js'
@@ -397,6 +408,43 @@ resources.define('tts-supertonic-enhanced', {
   }
 })
 
+resources.define('bci', {
+  constant: BCI_WINDOWED,
+  type: 'bci-whispercpp-transcription',
+  skipPreDownload: true,
+  config: {
+    whisperConfig: { language: 'en', temperature: 0.0 },
+    miscConfig: { caption_enabled: false },
+    bciConfig: { day_idx: 1 }
+  }
+})
+
+resources.define('diffusion', {
+  constant: FLUX_2_KLEIN_4B_Q4_0,
+  type: 'sdcpp-generation',
+  skipPreDownload: true,
+  config: {
+    device: 'gpu',
+    threads: 4,
+    prediction: 'flux2_flow',
+    llmModelSrc: QWEN3_4B_Q4_K_M,
+    vaeModelSrc: FLUX_2_KLEIN_4B_VAE
+  }
+})
+
+resources.define('audiogen-turbo', {
+  type: 'audiogen-ggml',
+  skipPreDownload: true,
+  config: {
+    textEncModelSrc: AUDIOGEN_QWEN3_EMBEDDING_0_6B_Q8_0,
+    lmModelSrc: AUDIOGEN_ACESTEP_5HZ_LM_0_6B_Q8_0,
+    ditModelSrc: AUDIOGEN_ACESTEP_V15_TURBO_Q4_K_M,
+    vaeModelSrc: AUDIOGEN_VAE_BF16,
+    useGPU: true,
+    inferenceSteps: 8
+  }
+})
+
 resources.define('parakeet-tdt', {
   constant: PARAKEET_TDT_0_6B_V3_Q4_0,
   type: 'parakeet-transcription',
@@ -594,8 +642,20 @@ export const executor = createExecutor({
       'Tools test disabled on mobile'
     ),
     new SkipExecutor(
+      /^deferred-tools-(?!prompt-cost$|load-then-call$)/,
+      'Deferred tools: only the smoke cases run on mobile (no tools-qwen35 resource, model reloads too slow)'
+    ),
+    new SkipExecutor(
       /^(diffusion-|addon-logging-diffusion$)/,
       'SD v2.1 1B Q8_0 cold-load is too heavy for Device Farm devices (OOM, 3+GB)'
+    ),
+    new SkipExecutor(
+      /^model-fit-probe-bci$/,
+      'BCI addon tests are desktop-only until mobile support is enabled; the smoke assessment needs no load and still runs'
+    ),
+    new SkipExecutor(
+      /^model-fit-probe-(?:audiogen|diffusion)$/,
+      'Reading the projection needs a resident model, and both sets are too heavy to load on Device Farm devices; the smoke assessment needs no load and still runs'
     ),
     new SkipExecutor(
       /^audio-(gen|edit|understand)-/,
@@ -614,6 +674,9 @@ export const executor = createExecutor({
       /^parakeet-indic-conformer-/,
       'Indic Conformer e2e is desktop-only; the parakeet-indic-conformer resource is not defined on mobile'
     ),
+    ...(Platform.OS === 'android'
+      ? [new SkipExecutor(/^parakeet-unified-coreml-ios$/, 'Core ML requires iOS')]
+      : []),
     new SkipExecutor(
       /^vla-groot-/,
       'GR00T e2e is desktop-only; the vla-groot resource is not defined on mobile'
@@ -637,7 +700,8 @@ export const executor = createExecutor({
           skipTests(
             ['parakeet-stream-eou', 'parakeet-stream-iterator-throw'],
             'Parakeet streaming EOU/iterator recovery is flaky on Android'
-          )
+          ),
+          skipTests(['tts-audio8-coreml'], 'Core ML runs on macOS and iOS only')
         ]
       : []),
     ...(Platform.OS === 'ios'
@@ -678,9 +742,11 @@ export const executor = createExecutor({
     new MobileRagExecutor(resources),
     new VectorIndexExecutor(resources),
     new ModelInfoExecutor(resources),
+    new ModelFitExecutor(resources),
     new WrongModelExecutor(resources),
     new ErrorExecutor(resources),
     new ToolsExecutor(resources),
+    new DeferredToolsExecutor(resources),
     new TranslationExecutor(resources),
     new ShardedModelExecutor(resources),
     new MobileOcrExecutor(resources),
@@ -698,6 +764,7 @@ export const executor = createExecutor({
     new MobileDownloadResilienceExecutor(resolveBakedMqttHost()),
     new DownloadExecutor(),
     new LifecycleExecutor(resources),
+    new RpcServerExecutor(),
     new SystemResourcesExecutor(Platform.OS),
     new ConfigExecutor(),
     new MobileCancellationExecutor(resources),

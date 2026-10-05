@@ -1,5 +1,7 @@
 import { z } from 'zod'
 import { modelRegistryEntrySchema } from '@/schemas/registry'
+import { modelSrcInputSchema } from '@/schemas/model-src-utils'
+import { modelTypeInputSchema } from '@/schemas/model-types'
 
 /**
  * Advisory outcome of a pre-download fit assessment.
@@ -10,36 +12,11 @@ import { modelRegistryEntrySchema } from '@/schemas/registry'
 export const modelFitVerdictSchema = z.enum(['likely-fits', 'likely-too-large', 'unknown'])
 
 /**
- * Normalized workload shapes. An engine's estimator declares which kinds it
- * supports; anything else assesses as `unknown`.
- *
- * Phase 1 covers LLM context and an audio window. Further kinds (fixed-cost
- * loads, text, image, video) are additive in later phases — a kind joins the
- * union only once an estimator actually handles it.
+ * What the estimator sizes a load by, read out of its config. An engine whose
+ * estimator declares no kind for it assesses as `unknown`.
  */
-export const modelFitWorkloadSchema = z.discriminatedUnion('kind', [
-  z
-    .object({
-      kind: z.literal('llm'),
-      contextTokens: z
-        .number()
-        .int()
-        .positive()
-        .describe('Context window the caller intends to use, in tokens.')
-    })
-    .describe('Token-context workload for llama.cpp completion and embedding models.'),
-  z
-    .object({
-      kind: z.literal('audio'),
-      windowMs: z
-        .number()
-        .positive()
-        .describe('Audio window handed to the engine per call, in milliseconds.'),
-      streaming: z.boolean().describe('Whether the caller streams continuously.'),
-      batch: z.number().int().positive().optional().describe('Concurrent windows per call.')
-    })
-    .describe('Audio-window workload for speech-to-text models.')
-])
+export type ModelFitWorkload =
+  { kind: 'llm'; contextTokens?: number } | { kind: 'audio'; windowMs: number; streaming: boolean }
 
 /**
  * The part of a model constant an assessment reads. Pass a catalog constant
@@ -68,21 +45,15 @@ export const modelFitModelRefSchema = modelRegistryEntrySchema
   })
 
 /**
- * One model the caller is considering, with the workload it would run.
- *
- * @property model - A catalog model constant. The generated resource profile,
- *   looked up by checksum, supplies the byte totals and transformer facts.
- * @property artifacts - Extra catalog constants a compound load needs (a VAD
- *   model, a pivot model). Their artifact bytes are added to this candidate.
+ * What the estimator is given for one candidate: the catalog facts its checksum
+ * resolves to, and the workload read out of the load's config.
  */
-export const modelFitCandidateSchema = z.object({
-  model: modelFitModelRefSchema.describe('Catalog model constant to assess.'),
-  artifacts: z
-    .array(modelFitModelRefSchema)
-    .optional()
-    .describe('Additional catalog constants this load also requires.'),
-  workload: modelFitWorkloadSchema.describe('Workload the caller intends to run.')
-})
+export interface ModelFitEstimateTarget {
+  model: ModelFitModelRef
+  workload: ModelFitWorkload
+  artifacts?: ModelFitModelRef[]
+  device?: string
+}
 
 /**
  * How the caller intends to run the candidates. This is a **declared
@@ -95,11 +66,36 @@ export const modelFitCandidateSchema = z.object({
  */
 export const modelFitExecutionSchema = z.enum(['sequential', 'concurrent'])
 
+/**
+ * A load to assess, in `loadModel`'s own parameters. The engine's plugin
+ * resolves it, so the config and the artifact keys the fitter reads are the
+ * ones the load would run with.
+ *
+ * Each source resolves to the registry's weightless description of the
+ * artifact, or to the file itself where it is already on disk.
+ */
+export const modelFitCandidateSchema = z.object({
+  modelSrc: modelSrcInputSchema
+    .optional()
+    .describe(
+      'The model to assess, as `loadModel` takes it. Optional for the loads `loadModel` also takes without one, where every source is a config field.'
+    ),
+  modelType: modelTypeInputSchema
+    .optional()
+    .describe(
+      'Engine that would run the load. Inferred from `modelSrc` when omitted, as `loadModel` infers it; required only where the source does not name one.'
+    ),
+  modelConfig: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe('The config `loadModel` would be given, including any companion model sources.')
+})
+
 export const assessModelFitInputSchema = z.object({
   models: z
     .array(modelFitCandidateSchema)
     .min(1)
-    .describe('Candidates to assess together under one memory budget.'),
+    .describe('Models to assess together under one memory budget.'),
   execution: modelFitExecutionSchema
     .default('sequential')
     .describe(
@@ -194,6 +190,12 @@ export const modelFitModelResultSchema = z.object({
     .describe(
       'Estimator that produced the bounds, e.g. `llm-v1`, or `floor-v1` for a computed floor.'
     ),
+  device: z
+    .string()
+    .optional()
+    .describe(
+      'Where this load resolved to execute, after the host’s own device defaults: `gpu` or `cpu`. The llama fitters read device memory alone and decline a `cpu` load, which then carries no `native-fit` evidence; the speech and voice fitters answer for one like any other. Absent for an engine that expresses no placement.'
+    ),
   reasons: z.array(z.string()).describe('Why this model got this verdict.')
 })
 
@@ -233,8 +235,8 @@ export const assessModelFitResultSchema = z.object({
  * The other fit question, kept in this file on purpose: `assessModelFit` above
  * answers "should I download this?" from calibrated coefficients and a checksum,
  * while the native probe answers "will the load I am about to run fit?" by
- * reading the GGUF on disk in a disposable child. Two evidence classes, so two
- * verdict vocabularies:
+ * handing the model file and the resolved settings to the fitter of the engine
+ * that would run it. Two evidence classes, so two verdict vocabularies:
  *
  * - `likely-fits` / `likely-too-large` hedge because a formula is an estimate.
  * - `fit` / `does-not-fit` do not, because the probe measured this build of this
@@ -252,20 +254,63 @@ export const nativeProbePlanSchema = z.object({
   nGpuDevices: z.number().int().describe('GPU devices the offload would span.')
 })
 
+/**
+ * What the fitter measured. Each field is optional because the engines do not
+ * all measure the same things: the diffusion fitter answers with a placement
+ * and a per-module table rather than a total, so it fills `report` alone.
+ *
+ * `weightsBytes`, `contextBytes` and `computeBytes` divide `deviceBytes` where
+ * the engine separates them, and are absent together where it reports only a
+ * total. They are summed across devices, as `deviceBytes` is, so a load spread
+ * over more than one device is described by its totals and `deviceName` names
+ * the first.
+ *
+ * `deviceFreeBytes` is the backend's own gauge. A device sharing the host pool,
+ * as Apple silicon and Adreno/Mali do, reports what it could address rather
+ * than what the machine would give back, so it is an upper bound there.
+ */
+export const nativeProbeProjectionSchema = z.object({
+  deviceName: z.string().optional().describe('Device the projection was made against.'),
+  deviceBytes: z
+    .number()
+    .optional()
+    .describe('Peak the load would place on the device, under the workload the probe assumed.'),
+  hostBytes: z.number().optional().describe('Peak the load would place in host RAM.'),
+  weightsBytes: z.number().optional().describe('Model weights, within `deviceBytes`.'),
+  contextBytes: z
+    .number()
+    .optional()
+    .describe('Context, KV cache and decoder state, within `deviceBytes`.'),
+  computeBytes: z
+    .number()
+    .optional()
+    .describe('Compute buffers and graph arenas, within `deviceBytes`.'),
+  deviceFreeBytes: z.number().optional().describe('Device memory free when the probe ran.'),
+  deviceTotalBytes: z.number().optional().describe('Device memory installed.'),
+  report: z
+    .string()
+    .optional()
+    .describe("The engine's own per-module memory table, suitable for a log line.")
+})
+
 export const nativeProbeFitSchema = z
   .object({
     verdict: nativeProbeVerdictSchema.describe(
-      'Advisory outcome. `unknown` means no verdict was obtainable — the check was disabled, the load shape is unsupported, or the child produced no usable answer.'
+      'Advisory outcome. `unknown` means no verdict was obtainable — the check was disabled, the load shape is unsupported, or the fitter produced no usable answer.'
     ),
     basis: z
       .literal('native-probe')
       .describe(
-        'Evidence class: a disposable llama.cpp child that read the model file and the resolved load settings.'
+        "Evidence class: the engine's own fitter, run against the model file and the resolved load settings."
       ),
+    engine: z
+      .string()
+      .optional()
+      .describe('Engine package whose fitter produced this outcome. Absent when none ran.'),
     estimatorVersion: z
       .string()
       .describe(
-        'Version of the probe integration that produced this outcome, covering the load-setting partitioning and the headroom policy — `native-probe-v1` withholds 1024 MiB plus the on-disk bytes of every model already resident in this worker.'
+        'Version of the probe integration that produced this outcome, covering the load-setting partitioning and the headroom policy. Under `native-probe-v2` the engine withholds 1024 MiB plus the on-disk bytes of every model already resident in this worker, and a `fit` is then judged against the same budget `assessModelFit` reports, under the basis that platform uses and less the `interactive-v1` reserve, counting device memory only where it comes out of system RAM.'
       ),
     reason: z
       .string()
@@ -273,7 +318,12 @@ export const nativeProbeFitSchema = z
     message: z.string().optional().describe('Human-readable detail, when the reason has any.'),
     plan: nativeProbePlanSchema
       .optional()
-      .describe('Placement the probe projected. Present only on a `fit` verdict.')
+      .describe('Placement the probe projected. Present wherever the fitter resolved one.'),
+    projection: nativeProbeProjectionSchema
+      .optional()
+      .describe(
+        'What the fitter measured. Present on `fit` and `does-not-fit` alike, since a load that does not fit is where the figures matter most.'
+      )
   })
   .meta({ title: 'NativeProbeFit' })
 
@@ -287,10 +337,10 @@ export const assessModelFitResponseSchema = assessModelFitResultSchema.extend({
 
 export type NativeProbeVerdict = z.infer<typeof nativeProbeVerdictSchema>
 export type NativeProbePlan = z.infer<typeof nativeProbePlanSchema>
+export type NativeProbeProjection = z.infer<typeof nativeProbeProjectionSchema>
 export type NativeProbeFit = z.infer<typeof nativeProbeFitSchema>
 export type ModelFitVerdict = z.infer<typeof modelFitVerdictSchema>
 export type ModelFitModelRef = z.infer<typeof modelFitModelRefSchema>
-export type ModelFitWorkload = z.infer<typeof modelFitWorkloadSchema>
 export type ModelFitCandidate = z.infer<typeof modelFitCandidateSchema>
 export type ModelFitExecution = z.infer<typeof modelFitExecutionSchema>
 export type ModelFitBasis = z.infer<typeof modelFitBasisSchema>

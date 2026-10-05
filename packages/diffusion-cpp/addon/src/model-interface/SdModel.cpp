@@ -331,16 +331,12 @@ SdModel::SdModel(qvac_lib_inference_addon_sd::SdCtxConfig config)
 SdModel::~SdModel() = default;
 
 // ---------------------------------------------------------------------------
-// load() -- maps SdCtxConfig -> sd_ctx_params_t, then calls new_sd_ctx()
+// fillCtxParams() -- maps SdCtxConfig -> sd_ctx_params_t, shared by load()
+// and assessFit()
 // ---------------------------------------------------------------------------
 
-void SdModel::load() {
-  if (isLoaded())
-    return;
-
-  const auto tLoadStart = std::chrono::steady_clock::now();
-
-  sd_ctx_params_t params{};
+void SdModel::fillCtxParams(CtxParams& out) const {
+  sd_ctx_params_t& params = out.params;
   sd_ctx_params_init(&params);
 
   // -- Model paths ------------------------------------------------------------
@@ -431,9 +427,9 @@ void SdModel::load() {
         "Effective stable-diffusion max_vram '" + config_.maxVramSpec + "'");
   }
 
-  std::string paramsBackend =
-      qvac_lib_inference_addon_sd::effectiveParamsBackendSpec(
-          config_.paramsBackendSpec, config_.offloadToCpu);
+  std::string& paramsBackend = out.paramsBackend;
+  paramsBackend = qvac_lib_inference_addon_sd::effectiveParamsBackendSpec(
+      config_.paramsBackendSpec, config_.offloadToCpu);
   if (config_.offloadToCpu &&
       qvac_lib_inference_addon_sd::paramsBackendSpecOverridesCpuDefault(
           config_.paramsBackendSpec)) {
@@ -469,7 +465,7 @@ void SdModel::load() {
   params.preferred_gpu_backend =
       sd_backend_selection::preferredGpuBackendForConfigDevice(config_.device);
 
-  std::string mainGpuBackend;
+  std::string& mainGpuBackend = out.mainGpuBackend;
   if (!config_.backendSpec.empty()) {
     params.backend = config_.backendSpec.c_str();
     if (!config_.mainGpu.empty()) {
@@ -537,6 +533,108 @@ void SdModel::load() {
   params.diffusion_conv_direct = config_.diffusionConvDirect;
   params.vae_conv_direct = config_.vaeConvDirect;
   params.force_sdxl_vae_conv_scale = config_.forceSDXLVaeConvScale;
+}
+
+SdModel::FitOutcome SdModel::assessFit(const FitWorkload& workload) const {
+  CtxParams ctx;
+  fillCtxParams(ctx);
+
+  FitOutcome outcome;
+
+  // `sd_fit_params` answers any pinned placement with SD_FIT_FAILURE, and a
+  // `device` of cpu reaches it as `preferred_gpu_backend`, which its planner
+  // does not read: it would judge a CPU load against the first GPU's budget.
+  const bool pinnedBackend =
+      ctx.params.backend != nullptr && ctx.params.backend[0] != '\0';
+  const bool pinnedParams =
+      !ctx.paramsBackend.empty() && ctx.paramsBackend != "*=cpu";
+  const bool cpuPreferred =
+      ctx.params.preferred_gpu_backend == SD_BACKEND_PREF_CPU;
+  // An OpenCL load is planned against the first enumerated GPU like any
+  // other, so it describes that load only where OpenCL is that device.
+  const bool openClElsewhere =
+      ctx.params.preferred_gpu_backend == SD_BACKEND_PREF_OPENCL &&
+      !sd_backend_selection::openClPreferenceMatchesEnumeratedGpu();
+  if (pinnedBackend || pinnedParams || cpuPreferred || openClElsewhere) {
+    outcome.status = SD_FIT_ERROR;
+    outcome.reason = "unsupported-config";
+    return outcome;
+  }
+
+  const bool offloadParamsToCpu = ctx.paramsBackend == "*=cpu";
+  ctx.params.backend = nullptr;
+  ctx.params.params_backend =
+      offloadParamsToCpu ? ctx.paramsBackend.c_str() : nullptr;
+
+  sd_fit_workload_t request{};
+  sd_fit_workload_init(&request);
+  request.prompt = workload.prompt.empty() ? nullptr : workload.prompt.c_str();
+  request.width = workload.width;
+  request.height = workload.height;
+  request.video_frames = workload.videoFrames;
+  request.vae_tiling_params.enabled = workload.vaeTiling;
+  request.vae_tiling_params.tile_size_x = workload.vaeTileSizeX;
+  request.vae_tiling_params.tile_size_y = workload.vaeTileSizeY;
+  request.vae_tiling_params.target_overlap = workload.vaeTileOverlap;
+
+  sd_fit_result_t result{};
+  try {
+    outcome.status = sd_fit_params(&ctx.params, &request, &result);
+  } catch (const std::exception& error) {
+    QLOG_IF(
+        qvac_lib_inference_addon_cpp::logger::Priority::ERROR,
+        std::string("fit assessment threw: ") + error.what());
+    sd_fit_result_free(&result);
+    return outcome;
+  }
+  outcome.changed = result.changed;
+  outcome.vaeTiling = result.vae_tiling;
+  outcome.streamLayers = result.stream_layers;
+  if (result.backend != nullptr)
+    outcome.backend = result.backend;
+  if (result.params_backend != nullptr)
+    outcome.paramsBackend = result.params_backend;
+  if (result.report != nullptr)
+    outcome.report = result.report;
+  sd_fit_result_free(&result);
+
+  // With params offloaded the engine plans a placement for every module and
+  // always reports it as a change, so the plan is compared against the one an
+  // "*=cpu" load makes for itself.
+  if (outcome.status == SD_FIT_SUCCESS && outcome.changed &&
+      offloadParamsToCpu &&
+      sd_backend_selection::matchesCpuOffloadPlacement(
+          outcome.backend,
+          outcome.paramsBackend,
+          outcome.vaeTiling,
+          outcome.streamLayers,
+          workload.vaeTiling,
+          config_.streamLayers)) {
+    outcome.changed = false;
+  }
+
+  if (outcome.status == SD_FIT_SUCCESS) {
+    outcome.reason = outcome.changed ? "does-not-fit" : "fits";
+  } else if (outcome.status == SD_FIT_FAILURE) {
+    outcome.reason = "does-not-fit";
+  }
+
+  return outcome;
+}
+
+// ---------------------------------------------------------------------------
+// load() -- builds the context params, then calls new_sd_ctx()
+// ---------------------------------------------------------------------------
+
+void SdModel::load() {
+  if (isLoaded())
+    return;
+
+  const auto tLoadStart = std::chrono::steady_clock::now();
+
+  CtxParams ctx;
+  fillCtxParams(ctx);
+  sd_ctx_params_t& params = ctx.params;
 
   sd_ctx_t* raw = new_sd_ctx(&params);
   if (!raw) {
@@ -746,6 +844,9 @@ SdModel::processImage(const GenerationJob& job, const picojson::value& parsed) {
   //     is rejected outright for these architectures.
   //
   sd_image_t initImg{}; // single-image (SDEdit or 1x FLUX)
+  std::unique_ptr<uint8_t, image_codec::FreeDeleter> initData;
+  std::unique_ptr<uint8_t, image_codec::FreeDeleter> maskData;
+  uint64_t decodedPixels = 0;
   std::vector<uint8_t> initPng;
   // Owned storage for genParams.ref_image_args; must outlive
   // generate_image(). Replaces the removed auto_resize_ref_image /
@@ -760,7 +861,7 @@ SdModel::processImage(const GenerationJob& job, const picojson::value& parsed) {
       return;
     for (auto& img : *v) {
       if (img.data) {
-        free(img.data);
+        image_codec::FreeDeleter{}(img.data);
         img.data = nullptr;
       }
     }
@@ -803,14 +904,26 @@ SdModel::processImage(const GenerationJob& job, const picojson::value& parsed) {
                   "] is empty -- every reference must be a non-empty "
                   "PNG/JPEG buffer.");
 
-        sd_image_t decoded = image_codec::decodeImage(job.initImagesBytes[i]);
+        image_codec::DecodeFailure decodeFailure;
+        sd_image_t decoded = image_codec::decodeImage(
+            job.initImagesBytes[i],
+            config_.maxJobPixels - decodedPixels,
+            &decodeFailure,
+            config_.maxImagePixels);
         if (decoded.data == nullptr) {
           throw StatusError(
               general_error::InvalidArgument,
               "img2img: failed to decode init_images[" + std::to_string(i) +
-                  "] (corrupt or unsupported format; supported: PNG, JPEG)");
+                  "]: " +
+                  image_codec::decodeFailureMessage(
+                      decodeFailure,
+                      config_.maxImagePixels,
+                      config_.maxJobPixels));
         }
+        std::unique_ptr<uint8_t, image_codec::FreeDeleter> owned(decoded.data);
         refImgs->push_back(decoded);
+        owned.release();
+        decodedPixels += static_cast<uint64_t>(decoded.width) * decoded.height;
       }
 
       // Output dimensions come from the JS shim (addon.js::_fillDimsFromImage,
@@ -866,7 +979,22 @@ SdModel::processImage(const GenerationJob& job, const picojson::value& parsed) {
         }
       }
       if (!initPng.empty()) {
-        initImg = image_codec::decodeImage(initPng);
+        image_codec::DecodeFailure decodeFailure;
+        initImg = image_codec::decodeImage(
+            initPng,
+            config_.maxImagePixels,
+            &decodeFailure,
+            config_.maxImagePixels);
+        if (initImg.data == nullptr) {
+          throw StatusError(
+              general_error::InvalidArgument,
+              "img2img: failed to decode init_image: " +
+                  image_codec::decodeFailureMessage(
+                      decodeFailure,
+                      config_.maxImagePixels,
+                      config_.maxJobPixels));
+        }
+        initData.reset(initImg.data);
       }
 
       if (initImg.data == nullptr) {
@@ -933,7 +1061,7 @@ SdModel::processImage(const GenerationJob& job, const picojson::value& parsed) {
                 "Failed to resize init_image from " + std::to_string(imgW) +
                     "x" + std::to_string(imgH) + " to " +
                     std::to_string(alignedW) + "x" + std::to_string(alignedH));
-          free(initImg.data);
+          initData.reset(resized.data);
           initImg = resized;
         }
 
@@ -952,19 +1080,19 @@ SdModel::processImage(const GenerationJob& job, const picojson::value& parsed) {
         if (!genParams.mask_image.data) {
           const size_t maskSize =
               static_cast<size_t>(alignedW) * static_cast<size_t>(alignedH);
-          auto* maskData = static_cast<uint8_t*>(malloc(maskSize));
+          maskData.reset(static_cast<uint8_t*>(malloc(maskSize)));
           if (!maskData)
             throw StatusError(
                 general_error::InternalError,
                 "Failed to allocate " + std::to_string(maskSize) +
                     " bytes for SDEdit mask (" + std::to_string(alignedW) +
                     "x" + std::to_string(alignedH) + ")");
-          memset(maskData, 255, maskSize);
+          memset(maskData.get(), 255, maskSize);
           genParams.mask_image = {
               static_cast<uint32_t>(alignedW),
               static_cast<uint32_t>(alignedH),
               1,
-              maskData};
+              maskData.get()};
         }
       } // end SDEdit else
     } // end single-image else (nMulti == 0)
@@ -992,6 +1120,13 @@ SdModel::processImage(const GenerationJob& job, const picojson::value& parsed) {
       tEnc = gen.steps - 1;
     g_progressCtx.denoiseTotals.push_back(tEnc + 1);
   }
+  if (gen.upscale &&
+      !upscaler_.outputFitsLimits(
+          genParams.width, genParams.height, gen.upscaleRepeats)) {
+    throw StatusError(
+        general_error::InvalidArgument,
+        "ESRGAN output exceeds configured pixel or 16,384 pixel edge limit");
+  }
   const auto t0 = std::chrono::steady_clock::now();
 
   sd_image_t* genImages = nullptr;
@@ -1003,13 +1138,6 @@ SdModel::processImage(const GenerationJob& job, const picojson::value& parsed) {
   // VAE-decode boundary: captured before PNG encode / upscale / output so
   // vaeMs reflects only the in-library decode, not post-processing.
   const auto tGen = std::chrono::steady_clock::now();
-
-  if (initImg.data) {
-    free(initImg.data);
-  }
-  if (genParams.mask_image.data) {
-    free(genParams.mask_image.data);
-  }
 
   if (!genOk) {
     if (cancelRequested_.load()) {
@@ -1370,17 +1498,25 @@ SdModel::processVideo(const GenerationJob& job, const picojson::value& parsed) {
   PixelBuffer initData;
   std::vector<PixelBuffer> controlData;
   std::vector<PixelBuffer> referenceData;
+  uint64_t decodedPixels = 0;
 
   if (!job.initImageBytes.empty()) {
-    initImg = image_codec::decodeImage(job.initImageBytes);
+    image_codec::DecodeFailure decodeFailure;
+    initImg = image_codec::decodeImage(
+        job.initImageBytes,
+        config_.maxJobPixels,
+        &decodeFailure,
+        config_.maxImagePixels);
     if (!initImg.data)
       throw StatusError(
           general_error::InvalidArgument,
-          "processVideo: failed to decode init_image (corrupt or "
-          "unsupported format; supported: PNG, JPEG)");
+          "processVideo: failed to decode init_image: " +
+              image_codec::decodeFailureMessage(
+                  decodeFailure, config_.maxImagePixels, config_.maxJobPixels));
     // Take ownership *before* the dimension check so a mismatch can't leak
     // the freshly-decoded pixel buffer (mirrors the control_frames path).
     initData.reset(initImg.data);
+    decodedPixels += static_cast<uint64_t>(initImg.width) * initImg.height;
     if (static_cast<int>(initImg.width) != vid.width ||
         static_cast<int>(initImg.height) != vid.height)
       throw StatusError(
@@ -1396,13 +1532,21 @@ SdModel::processVideo(const GenerationJob& job, const picojson::value& parsed) {
     controlFrames.reserve(job.controlFramesBytes.size());
     controlData.reserve(job.controlFramesBytes.size());
     for (size_t i = 0; i < job.controlFramesBytes.size(); ++i) {
-      sd_image_t decoded = image_codec::decodeImage(job.controlFramesBytes[i]);
+      image_codec::DecodeFailure decodeFailure;
+      sd_image_t decoded = image_codec::decodeImage(
+          job.controlFramesBytes[i],
+          config_.maxJobPixels - decodedPixels,
+          &decodeFailure,
+          config_.maxImagePixels);
       if (!decoded.data)
         throw StatusError(
             general_error::InvalidArgument,
             "processVideo: failed to decode control_frames[" +
-                std::to_string(i) +
-                "] (corrupt or unsupported format; supported: PNG, JPEG)");
+                std::to_string(i) + "]: " +
+                image_codec::decodeFailureMessage(
+                    decodeFailure,
+                    config_.maxImagePixels,
+                    config_.maxJobPixels));
       // Take ownership *before* the dimension check so a mismatch can't leak.
       PixelBuffer owned(decoded.data);
       if (static_cast<int>(decoded.width) != vid.width ||
@@ -1416,6 +1560,7 @@ SdModel::processVideo(const GenerationJob& job, const picojson::value& parsed) {
                 "x" + std::to_string(vid.height));
       controlData.push_back(std::move(owned));
       controlFrames.push_back(decoded);
+      decodedPixels += static_cast<uint64_t>(decoded.width) * decoded.height;
     }
   }
 
@@ -1423,16 +1568,24 @@ SdModel::processVideo(const GenerationJob& job, const picojson::value& parsed) {
     referenceImages.reserve(job.referenceImagesBytes.size());
     referenceData.reserve(job.referenceImagesBytes.size());
     for (size_t i = 0; i < job.referenceImagesBytes.size(); ++i) {
-      sd_image_t decoded =
-          image_codec::decodeImage(job.referenceImagesBytes[i]);
+      image_codec::DecodeFailure decodeFailure;
+      sd_image_t decoded = image_codec::decodeImage(
+          job.referenceImagesBytes[i],
+          config_.maxJobPixels - decodedPixels,
+          &decodeFailure,
+          config_.maxImagePixels);
       if (!decoded.data)
         throw StatusError(
             general_error::InvalidArgument,
             "processVideo: failed to decode reference_images[" +
-                std::to_string(i) +
-                "] (corrupt or unsupported format; supported: PNG, JPEG)");
+                std::to_string(i) + "]: " +
+                image_codec::decodeFailureMessage(
+                    decodeFailure,
+                    config_.maxImagePixels,
+                    config_.maxJobPixels));
       referenceData.emplace_back(decoded.data);
       referenceImages.push_back(decoded);
+      decodedPixels += static_cast<uint64_t>(decoded.width) * decoded.height;
     }
   }
 
