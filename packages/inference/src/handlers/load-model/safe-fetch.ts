@@ -102,12 +102,6 @@ function requestOnce(
       resolve(res)
     }
 
-    // Call through one module at a time: the union of the two request()
-    // overload sets shares no signature once bare-https's own bare-http1 types
-    // drift from this package's, so `protocol.request` does not resolve. The
-    // https branch's response is still declared against that older copy — the
-    // object is the same at runtime, so it is re-read as this package's
-    // bare-http1 IncomingMessage at the boundary.
     const req =
       url.protocol === 'https:'
         ? https.request(url, { method, headers }, (res) =>
