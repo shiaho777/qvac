@@ -39,7 +39,8 @@ on-pr-nx.yml            (pull_request_target)  ── PR orchestrator
   ├─ coload-smoke-mobile→ coload-smoke-mobile.yml        (asr/tts on-device co-load)
   ├─ perf-report(-rtf)                                   (informational)
   ├─ publish-prebuild-status  (scripts/prebuild-status/publish.mjs → qvac/prebuild-<pkg>)
-  └─ merge-guard        → public-pr.yml                  (produces qvac-merge-guard / validate-pr)
+  ├─ publish-cpp-test-status  (scripts/prebuild-status/publish.mjs KIND=cpp-tests → qvac/cpp-tests-<pkg>)
+  └─ merge-guard        → public-pr.yml                  (package-level merge-guard / validate-pr; not the required check)
 
 on-merge-nx.yml         (push to main/release/feature/tmp)  ── publish orchestrator
   ├─ detect             (per-package prebuild/publish matrices)
@@ -59,11 +60,17 @@ Per target, common fields (see any `packages/*/project.json`):
 - **build** — `artifactNamePrefix`, `includeVulkanSdk`, `includeRocm`, `linuxExtraPackages`, `macBrewPackages`, `extraCmakeDefines`, `platformCmakeDefines`. Presence of `build.options.ci` is what makes a package "have prebuilds" (`hasPrebuilds` is derived, not declared).
 - **on-pr** — `hasCppLint`, `hasTsChecks` (`tsChecksMode`), `hasFabricLockstep`, `cppTestsBaseline` (run the package's `test:cpp` lane on every PR, without the `run-cpp-addon-tests` label), `hasCoload`/`coloadActive`, `hasPerfReport` (`perfReportVariant`, `perfReportPattern`, `perfReportTitle`, `perfReportExtraArgs`).
 - **test:cpp** — `platforms[]` (os/platform/arch/runner), `vcpkgMode`, `coverageOn`, `mode`, plus per-package flags; `carveOut: true` routes to a bespoke reusable.
-- **test:integration** — usually just `carveOut: true` for packages with bespoke integration flows (asr, llm).
+- **test:integration** — `platforms[]` rows, each able to override any shared field (e.g. `timeoutMinutes`, `modelDownloadScript`); `testScript`, the npm script a leg runs instead of `test:integration` (darwin-x64 legs point it at a single-suite smoke script); `carveOut: true` for packages with bespoke integration flows (asr, llm).
 - **benchmark** — `aggregateScript`, `manualDir`.
 - **on-merge** — `buildStep`, `nameTransform`, `repoName`, `testGateMode`.
 
 Per-run overrides are possible via the action's `overrides` input, but only for fields a package already declares (validated, so a PR can't inject new CI behaviour).
+
+For `asr-ggml`, `tts-ggml`, `audiogen-ggml`, and `bci-whispercpp`, PR-time cpp-lint additionally requires a changed C/C++ source or header (`.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, or `.hxx`) inside that package. The filter uses API-reported paths, including deleted files and previous paths for renames. Vcpkg version-only bumps skip cpp-lint, and the merge guard accepts that skipped job. Manual dispatch retains the affected packages' cpp-lint lanes.
+
+Speech C++ tests for `asr-ggml`, `tts-ggml`, and `bci-whispercpp` use the Ubuntu 22.04 x64 CPU runner in both their `test:cpp.options.ci.platforms` rows and standalone coverage workflows. The consolidated PR lane reads those target rows; changing only a standalone workflow does not change PR runner selection. `audiogen-ggml` has a hosted CPU stub until addon-level C++ tests exist. `runner-names.test.mjs`, included in the security policy suite, guards both routing paths.
+
+Package config is read from the trusted base ref. After merging a runner change into `main`, start a new run for an existing PR to resolve the updated matrix; already queued jobs retain the labels selected by their original run.
 
 ## Fork safety
 
@@ -81,7 +88,7 @@ Packages with bespoke flows set `carveOut: true` on the relevant target. `nx-pro
 
 ## Merge guard
 
-`pr-gate-merge.yml` → `public-pr.yml` produces the single required check `qvac-merge-guard / validate-pr`. Its `verify-prebuilds` step reads the `qvac/prebuild-<pkg>` commit statuses posted by `on-pr-nx`'s `publish-prebuild-status` job, trusting **only** the `on-pr-nx.yml` producer and the newest fresh status (`scripts/prebuild-status/lib.mjs`, unit-tested in `prebuild-status.test.mjs`). Wiring a new gated job in: see `docs/ci/MERGE-GUARD.md` / the `qv-merge-guard-wire` skill.
+`pr-gate-merge.yml` → `public-pr.yml` produces the single required check `qvac-merge-guard / validate-pr`. `verify-prebuilds` reads `qvac/prebuild-<pkg>` statuses from `publish-prebuild-status`; `verify-cpp-tests` reads `qvac/cpp-tests-<pkg>` statuses from `publish-cpp-test-status`. Both trust only the package's own producer (`on-pr-nx.yml`, or the carved-out package's `on-pr-<pkg>.yml`) and the newest fresh status from it (`scripts/prebuild-status/lib.mjs`, unit-tested in `prebuild-status.test.mjs`). Wiring a new gated job in: see `docs/ci/MERGE-GUARD.md` / the `qv-merge-guard-wire` skill.
 
 ## Mobile
 

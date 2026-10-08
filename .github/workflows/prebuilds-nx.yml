@@ -98,6 +98,10 @@ jobs:
       repository: ${{ inputs.repository || 'tetherto/qvac' }}
       # No artifact naming passed: the reusable derives both the per-leg and merged
       # bundle names from the package, so several packages can build in one run.
+      matrix-include: ${{ matrix.matrixInclude || 'default' }}
+      desktop-smoke-command: ${{ matrix.desktopSmokeCommand }}
+      post-artifact-build-command: ${{ matrix.postArtifactBuildCommand }}
+      extra-strip-binary-name: ${{ matrix.extraStripBinaryName }}
       linux-extra-packages: ${{ matrix.linuxExtraPackages }}
       mac-brew-packages: ${{ matrix.macBrewPackages }}
       setup-python-on-windows: ${{ matrix.setupPythonOnWindows == true }}
@@ -107,7 +111,8 @@ jobs:
       extra-cmake-defines: ${{ matrix.extraCmakeDefines }}
       platform-cmake-defines: ${{ matrix.platformCmakeDefines }}
       # Consumers only: overlaying fabric's own build into itself is meaningless.
-      fabric-overlay-artifact: ${{ contains(fromJSON(inputs.fabric-consumers), matrix.package) && inputs.fabric-overlay-artifact || '' }}
+      # fabric-consumers is a workflow_call input, so a dispatch has none.
+      fabric-overlay-artifact: ${{ contains(fromJSON(inputs.fabric-consumers || '[]'), matrix.package) && inputs.fabric-overlay-artifact || '' }}
       reuse-workflow-file: ${{ inputs.reuse-workflow-file }}
     secrets: inherit
 

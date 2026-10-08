@@ -16,10 +16,11 @@ import {
   ttsChatterboxLoadConfigSchema,
   ttsConfigSchema,
   ttsCosyvoice3LoadConfigSchema,
+  ttsMossLoadConfigSchema,
   ttsParlerLoadConfigSchema,
   ttsSupertonicLoadConfigSchema
 } from './text-to-speech'
-import { ocrConfigSchema } from './ocr'
+import { ocrConfigSchema, refineOcrMainGpuSelector } from './ocr'
 import {
   modelSrcInputSchema,
   modelInputToSrcSchema,
@@ -105,6 +106,7 @@ const modelConfigKeysByModelType = new Map<string, Set<string>>([
       ttsParlerLoadConfigSchema,
       ttsCosyvoice3LoadConfigSchema,
       ttsAudio8LoadConfigSchema,
+      ttsMossLoadConfigSchema,
       LEGACY_TTS_ONNX_MODEL_CONFIG_FIELDS
     )
   ],
@@ -203,7 +205,11 @@ export const loadBuiltinModelOptionsBaseSchema = z.union([
     .object({
       ...loadModelCommonFields,
       modelType: ocrModelTypeSchema,
-      modelConfig: ocrConfigSchema.partial().strict().optional()
+      modelConfig: ocrConfigSchema
+        .partial()
+        .strict()
+        .superRefine(refineOcrMainGpuSelector)
+        .optional()
     })
     .strict(),
   z
@@ -411,7 +417,11 @@ export const loadBuiltinToRequestSchema = z.discriminatedUnion('modelType', [
     .object({
       ...loadModelRequestCommonFields,
       modelType: ocrModelTypeSchema,
-      modelConfig: ocrConfigSchema.partial().strict().optional()
+      modelConfig: ocrConfigSchema
+        .partial()
+        .strict()
+        .superRefine(refineOcrMainGpuSelector)
+        .optional()
     })
     .strict()
     .transform((data) => ({
@@ -612,7 +622,7 @@ export const loadTtsModelRequestSchema = commonModelConfigSchema
 export const loadOcrModelRequestSchema = commonModelConfigSchema
   .extend({
     modelType: z.literal(ModelType.ggmlOcr),
-    modelConfig: ocrConfigSchema
+    modelConfig: ocrConfigSchema.superRefine(refineOcrMainGpuSelector)
   })
   .strict()
 

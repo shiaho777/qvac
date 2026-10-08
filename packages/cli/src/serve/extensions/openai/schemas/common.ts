@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import type { Tool } from '@qvac/sdk'
+import { TOOL_SEARCH_NAME, type Tool } from '@qvac/sdk'
 
 // ─── Wire-shape zod building blocks ────────────────────────────────────
 
@@ -39,9 +39,13 @@ export const toolDef = z
       .object({
         name: z.string(),
         description: z.string().optional(),
-        parameters: z.record(z.string(), z.unknown()).optional()
+        parameters: z.record(z.string(), z.unknown()).optional(),
+        defer_loading: z.boolean().optional(),
+        group: z.string().optional()
       })
-      .optional()
+      .optional(),
+    defer_loading: z.boolean().optional(),
+    group: z.string().optional()
   })
   .passthrough()
 
@@ -113,34 +117,41 @@ export type ResponseFormat =
 
 interface OpenAITool {
   type: string
+  // Accepted beside `function` as well, because clients that build the tool
+  // entry and the function body in different places put it in either.
+  defer_loading?: boolean
+  group?: string
   function?: {
     name: string
     description?: string
     parameters?: Record<string, unknown>
+    defer_loading?: boolean
+    group?: string
   }
 }
 
-const VALID_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'object', 'array'])
+const VALID_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'object', 'array', 'null'])
 
+// Only the property's own `type` is checked; nested keywords pass through, and a
+// property without `type` (an `anyOf`/`oneOf` union) is left as declared.
 export function normalizeToolParameters(params: Record<string, unknown>): Record<string, unknown> {
   const props = params['properties'] as Record<string, Record<string, unknown>> | undefined
   if (!props) return params
 
   const normalized: Record<string, Record<string, unknown>> = {}
   for (const [key, prop] of Object.entries(props)) {
-    normalized[key] = { ...prop, type: normalizeType(prop['type']) }
+    normalized[key] =
+      prop['type'] === undefined ? prop : { ...prop, type: normalizeType(prop['type']) }
   }
 
   return { ...params, properties: normalized }
 }
 
-function normalizeType(type: unknown): string {
-  if (typeof type === 'string' && VALID_TYPES.has(type)) return type
+function normalizeType(type: unknown): string | string[] {
+  if (typeof type === 'string') return VALID_TYPES.has(type) ? type : 'string'
   if (Array.isArray(type)) {
-    const primary = type.find(
-      (t): t is string => typeof t === 'string' && t !== 'null' && VALID_TYPES.has(t)
-    )
-    return primary ?? 'string'
+    const valid = type.filter((t): t is string => typeof t === 'string' && VALID_TYPES.has(t))
+    return valid.length > 0 ? valid : 'string'
   }
   return 'string'
 }
@@ -152,10 +163,14 @@ export function openaiToolsToSdk(tools: OpenAITool[] | undefined): Tool[] | unde
     .map((t): Tool | null => {
       if (t.type !== 'function' || !t.function) return null
       const fn = t.function
+      const deferLoading = fn.defer_loading ?? t.defer_loading
+      const group = fn.group ?? t.group
       return {
         type: 'function',
         name: fn.name,
         description: fn.description ?? '',
+        ...(deferLoading !== undefined && { deferLoading }),
+        ...(group !== undefined && { group }),
         parameters: normalizeToolParameters(
           fn.parameters ?? { type: 'object', properties: {} }
         ) as Tool['parameters']
@@ -224,9 +239,23 @@ export function extractToolChoice(
       `"tool_choice" ${JSON.stringify(choice)} requires at least one entry in "tools".`
     )
   }
-  if (choice !== 'required' && !tools.some((tool) => tool.name === choice)) {
+  if (choice === 'required') return choice
+
+  // `tool_search` is synthesised by the SDK rather than declared, so it is
+  // nameable exactly when the request defers something.
+  if (choice === TOOL_SEARCH_NAME && tools.some((tool) => tool.deferLoading === true)) {
+    return choice
+  }
+  const named = tools.find((tool) => tool.name === choice)
+  if (!named) {
     throw new InvalidToolChoiceError(
       `"tool_choice" names ${JSON.stringify(choice)}, which is not one of the declared tools.`
+    )
+  }
+  if (named.deferLoading === true) {
+    throw new InvalidToolChoiceError(
+      `"tool_choice" names ${JSON.stringify(choice)}, which sets "defer_loading". Its schema is ` +
+        `not in the prompt, so the call cannot be forced; use ${JSON.stringify(TOOL_SEARCH_NAME)} instead.`
     )
   }
   return choice

@@ -16,6 +16,7 @@ This native C++ addon, built using the `Bare` Runtime, simplifies running Large 
   - [6. Run Inference](#6-run-inference)
   - [7. Release Resources](#7-release-resources)
 - [API behavior by state](#api-behavior-by-state)
+- [Assessing fit](#assessing-fit)
 - [Fine-tuning](#fine-tuning)
 - [Quickstart Example](#quickstart-example)
 - [Other Examples](#other-examples)
@@ -44,7 +45,7 @@ BitNet models require special backend handling on Adreno GPUs. When a BitNet mod
 
 **Dependencies:**
 - inference-addon-cpp (≥1.3.3): C++ addon framework (multi-job scheduler)
-- @qvac/fabric (^0.16.1): Shared llama.cpp/ggml/mtmd inference engine. Installed from npm; it carries the prebuilt runtime in its own tarball, so it must be present before `bare-make generate`/`build` and must not be pruned at runtime
+- @qvac/fabric (^0.18.0): Shared llama.cpp/ggml/mtmd inference engine. The desktop runtime ships in the `@qvac/fabric-<host>` platform package that `@qvac/fabric` installs as an optional dependency, so install without `--omit=optional` and keep both present before `bare-make generate`/`build`. Android and iOS apps add `@qvac/fabric` and `@qvac/fabric-android-arm64` or `@qvac/fabric-ios` as direct dependencies at the same exact version.
 - Bare Runtime (≥1.24.0): JavaScript runtime
 - Linux requires Clang/LLVM 22 with libc++
 ## Installation
@@ -359,6 +360,35 @@ So a cancelled batch that contained queued prompts rejects with `Cancelled`; cal
 
 Cancelling a queued job resolves immediately, whether or not the slots it was waiting for are held by an unrelated run — you never wait out someone else's generation to cancel your own queued work.
 
+
+## Assessing fit
+
+`assessFit` projects a load against the memory free right now. It reads GGUF metadata and never weight data, so the registry's weightless copy of a model answers the same as the model itself and the projection can run before anything is downloaded.
+
+```js
+const LlmLlamacpp = require('@qvac/llm-llamacpp')
+
+const fit = LlmLlamacpp.assessFit({
+  modelPath: '/models/model.gguf',
+  config: { device: 'gpu', 'ctx-size': '4096' }
+})
+
+fit.status // 'fits' | 'does-not-fit' | 'error'
+fit.reason // 'fits', 'does-not-fit', 'model-unreadable', 'no-backend-device' or 'unsupported-config'
+fit.gpuLayers // what fits, which is not always what the request asked for
+fit.ctxSize
+fit.devices // one row per device the model was assigned to, then a `host` row
+fit.deviceBytes // model, context and compute summed across the devices, host excluded
+fit.hostBytes // the same, for the trailing host row
+```
+
+`config` is the load, exactly as `loadModel` takes it. The projection resolves it with the same code that load runs, so every setting reaches the fitter the way it would reach the engine, and a load the engine would refuse is refused here as `status: "error"` with `unsupported-config`. A setting left out takes llama's default.
+
+Pinning `gpu-layers` fixes the placement: the fitter refuses to move layers off a device the load claimed, so the answer is whether that exact placement fits, never a reduced one. Leave it unset for a projection that can place the model itself.
+
+`minCtxSize` sets a floor the fitter may not reduce the context below, defaulting to llama's own `fit-ctx` of 4096. `marginBytes` is the memory to leave free on every device, defaulting to llama's `fit-target` of 1 GiB per device. `backendsDir` is where the dynamically-loaded ggml backends live.
+
+A model the fitter cannot read is `status: "error"`; only a broken request throws.
 
 ## Fine-tuning
 
