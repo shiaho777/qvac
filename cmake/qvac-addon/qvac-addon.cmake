@@ -15,6 +15,17 @@
 #   qvac_addon_link_fabric(${<name>} ${qvac_fabric_target})
 #   qvac_addon_finalize(${<name>} SUBDIR "${BACKENDS_SUBDIR_VALUE}")
 #
+# Unmigrated addons that cannot call qvac_addon_preproject() (it also sets
+# overlay triplets and Android STL) still reuse the fuzz helpers:
+#
+#   include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/qvac-addon/qvac-addon.cmake)
+#   qvac_addon_fuzz_manifest()              # BEFORE project()
+#   project(<name> LANGUAGES C CXX)
+#   ...find_path(inference-addon-cpp)...
+#   qvac_addon_fuzz_only_return()           # skips engines + .bare when fuzz-only
+#   ...
+#   qvac_addon_add_fuzz_subdirectory()      # combined tests+fuzz configure
+#
 # qvac_addon_preproject / _project_setup / _use_fabric are macros on purpose:
 # they set directory-scope state (VCPKG_MANIFEST_FEATURES, the vcpkg toolchain,
 # ANDROID_STL, CMAKE_CXX_STANDARD, the fabric target var, ...) that must land in
@@ -23,6 +34,40 @@
 include_guard(GLOBAL)
 
 set(QVAC_ADDON_CMAKE_VERSION "0.3.0")
+
+# ---------------------------------------------------------------------------
+# qvac_addon_fuzz_manifest()
+#
+# Enable the vcpkg "fuzz" feature. Safe to call from unmigrated addons that
+# cannot use qvac_addon_preproject() (that macro also sets overlay triplets
+# and Android STL). Must run BEFORE project().
+# ---------------------------------------------------------------------------
+macro(qvac_addon_fuzz_manifest)
+  option(BUILD_FUZZING "Build fuzz targets (Google FuzzTest, from vcpkg)" OFF)
+  # The "fuzz" feature installs FuzzTest's dependency stack from the shared
+  # binary cache. See qvac_addon_enable_fuzztest() and
+  # docs/architecture/ADDON-FUZZING.md.
+  if(BUILD_FUZZING)
+    list(APPEND VCPKG_MANIFEST_FEATURES "fuzz")
+  endif()
+endmacro()
+
+macro(qvac_addon_add_fuzz_subdirectory)
+  if(BUILD_FUZZING)
+    enable_testing()
+    add_subdirectory(test/fuzz)
+  endif()
+endmacro()
+
+# Fuzz-only configure: BUILD_FUZZING without BUILD_TESTING. Builds just the
+# fuzz targets and skips the .bare module + engine find_package()s so pure
+# parse/transform drivers keep full ASan + LSan.
+macro(qvac_addon_fuzz_only_return)
+  if(BUILD_FUZZING AND NOT BUILD_TESTING)
+    qvac_addon_add_fuzz_subdirectory()
+    return()
+  endif()
+endmacro()
 
 # ---------------------------------------------------------------------------
 # qvac_addon_preproject()
@@ -34,16 +79,9 @@ set(QVAC_ADDON_CMAKE_VERSION "0.3.0")
 macro(qvac_addon_preproject)
   option(BUILD_TESTING "Build tests" OFF)
   option(ENABLE_COVERAGE "Enable coverage instrumentation for unit tests" OFF)
-  option(BUILD_FUZZING "Build fuzz targets (Google FuzzTest, from vcpkg)" OFF)
+  qvac_addon_fuzz_manifest()
   if(BUILD_TESTING)
     list(APPEND VCPKG_MANIFEST_FEATURES "tests")
-  endif()
-  # The "fuzz" feature installs the parts of FuzzTest's dependency stack that
-  # vcpkg can supply (GoogleTest, the ANTLR4 C++ runtime) so they come from the
-  # shared binary cache instead of a per-build-tree source compile. See
-  # qvac_addon_enable_fuzztest() and docs/architecture/ADDON-FUZZING.md.
-  if(BUILD_FUZZING)
-    list(APPEND VCPKG_MANIFEST_FEATURES "fuzz")
   endif()
 
   find_package(cmake-bare REQUIRED PATHS node_modules/cmake-bare)
@@ -116,19 +154,94 @@ endmacro()
 #                            to the runtime-provided backendsDir before calling
 #                            ggml_backend_load_all_from_path().
 #
-# The ggml compute backends live in @qvac/fabric's own prebuilds and are loaded
-# once per process; the addon neither collects nor installs them.
+# The ggml compute backends live next to the fabric runtime and are loaded once
+# per process; the addon neither collects nor installs them.
 # ---------------------------------------------------------------------------
 macro(qvac_addon_use_fabric)
   set(qvac-fabric_DIR
       "${CMAKE_CURRENT_SOURCE_DIR}/node_modules/@qvac/fabric/prebuilds/share/qvac-fabric/cmake")
   find_package(qvac-fabric CONFIG REQUIRED)
-  include_bare_module("@qvac/fabric" qvac_fabric_target PREBUILD)
 
   bare_target(bare_target_value)
+  qvac_addon_fabric_layout("${bare_target_value}" "${CMAKE_CURRENT_SOURCE_DIR}"
+    _qvac_fabric_specifier _qvac_fabric_working_dir _qvac_fabric_prebuilds)
+  include_bare_module("${_qvac_fabric_specifier}" qvac_fabric_target PREBUILD
+    WORKING_DIRECTORY "${_qvac_fabric_working_dir}")
+
   set(BACKENDS_SUBDIR_VALUE "${bare_target_value}/qvac__fabric")
   message(STATUS "qvac-addon: BACKENDS_SUBDIR='${BACKENDS_SUBDIR_VALUE}'")
 endmacro()
+
+# ---------------------------------------------------------------------------
+# qvac_addon_fabric_layout(<host> <base_dir> <out_specifier> <out_working_dir>
+#                          <out_prebuilds>)
+#
+# Which installed bare module provides prebuilds/<host>/qvac__fabric.bare, as an
+# include_bare_module() specifier + WORKING_DIRECTORY, plus that module's
+# prebuilds/ dir. Same precedence as @qvac/fabric's binding.js, so the build
+# links the runtime the addon will load:
+#
+#   1. @qvac/fabric itself when it carries prebuilds/<host>: every fabric before
+#      the 0.18 platform split, a source build or linked workspace, and the CI
+#      overlay, which writes the PR-built runtime there.
+#   2. The host's platform package, @qvac/fabric-<host>/addon. It is fabric's
+#      dependency rather than the addon's, so it is resolved from fabric's real
+#      path, as Node would from inside fabric (pnpm and nested npm installs do
+#      not put it in the addon's node_modules). Its addon/ manifest is named
+#      @qvac/fabric, which keeps the artifact qvac__fabric.bare and every
+#      shipped consumer's DT_NEEDED on it valid.
+#
+# With neither, configure fails naming the package to install. Cross-built
+# targets (android, ios) are never selected by os/cpu filters, so an addon that
+# builds them needs the platform package as a devDependency with the same range
+# as @qvac/fabric, so both resolve to the same release: the app supplies the
+# runtime at run time through its own direct dependency.
+# ---------------------------------------------------------------------------
+function(qvac_addon_fabric_layout host base_dir out_specifier out_working_dir out_prebuilds)
+  resolve_node_module("@qvac/fabric" _meta_dir WORKING_DIRECTORY "${base_dir}")
+  if(_meta_dir MATCHES "-NOTFOUND$")
+    message(FATAL_ERROR "qvac-addon: @qvac/fabric is not installed under ${base_dir}; run npm install first.")
+  endif()
+
+  set(${out_specifier} "@qvac/fabric" PARENT_SCOPE)
+  set(${out_working_dir} "${base_dir}" PARENT_SCOPE)
+  set(${out_prebuilds} "${_meta_dir}/prebuilds" PARENT_SCOPE)
+  if(IS_DIRECTORY "${_meta_dir}/prebuilds/${host}")
+    return()
+  endif()
+
+  if(host MATCHES "^ios-")
+    set(_platform_package "@qvac/fabric-ios")
+  else()
+    set(_platform_package "@qvac/fabric-${host}")
+  endif()
+
+  file(REAL_PATH "${_meta_dir}" _meta_real)
+  resolve_node_module("${_platform_package}/addon" _platform_addon WORKING_DIRECTORY "${_meta_real}")
+  if(NOT _platform_addon MATCHES "-NOTFOUND$")
+    message(STATUS "qvac-addon: fabric runtime from ${_platform_package}")
+    set(${out_specifier} "${_platform_package}/addon" PARENT_SCOPE)
+    set(${out_working_dir} "${_meta_real}" PARENT_SCOPE)
+    set(${out_prebuilds} "${_platform_addon}/prebuilds" PARENT_SCOPE)
+    return()
+  endif()
+
+  file(READ "${_meta_dir}/package.json" _meta_manifest)
+  string(JSON _meta_version GET "${_meta_manifest}" version)
+  if(host MATCHES "^(android|ios)-")
+    string(CONCAT _remedy
+      "Cross-built targets are never selected by os/cpu filters; add "
+      "\"${_platform_package}\": \"^${_meta_version}\" to devDependencies.")
+  else()
+    string(CONCAT _remedy
+      "It is an optional dependency of @qvac/fabric: reinstall without --omit=optional "
+      "(Yarn v1 skips optional dependencies), or build @qvac/fabric from source if it "
+      "publishes no runtime for ${host}.")
+  endif()
+  message(FATAL_ERROR
+    "qvac-addon: no fabric runtime for ${host}: @qvac/fabric has no prebuilds/${host} "
+    "and ${_platform_package} is not installed. ${_remedy}")
+endfunction()
 
 # ---------------------------------------------------------------------------
 # qvac_addon_import_fabric_cxx_runtime(<target> <fabric_target>)
@@ -227,8 +340,8 @@ endfunction()
 #     narrows the module's exports to the bare C entry points),
 #   * the assertion that a fabric-linked module imports fabric's C++ runtime,
 #   * JS_LOGGER + BACKENDS_SUBDIR compile definitions,
-#   * platform-derived GGML_BACKEND_DL (Linux/Android load ggml backends as
-#     dlopen'd modules; macOS/Windows/iOS link them static into the runtime),
+#   * platform-derived GGML_BACKEND_DL (Linux/Android/Windows load ggml
+#     backends as modules; Apple platforms link them static into the runtime),
 #   * Android 16 KB page-size link flags,
 #   * Apple compiler-rt force_load for __isPlatformVersionAtLeast.
 #
@@ -303,7 +416,7 @@ function(qvac_addon_finalize addon_target)
       BACKENDS_SUBDIR="${_QAF_SUBDIR}")
   endif()
 
-  if((ANDROID OR UNIX) AND NOT APPLE)
+  if((ANDROID OR UNIX OR WIN32) AND NOT APPLE)
     target_compile_definitions(${addon_target} PRIVATE GGML_BACKEND_DL)
   endif()
 
@@ -438,7 +551,7 @@ endfunction()
 #   * GGML_BACKEND_DL / GGML_BACKEND_DIR so backend_env.cpp preloads the ggml
 #     backend modules from the test binary dir,
 #   * copy qvac__fabric@0.bare next to the test binary,
-#   * stage @qvac/fabric's dlopen'd ggml backends (Linux/Android) alongside it,
+#   * stage @qvac/fabric's dynamically loaded ggml backends alongside it,
 #   * $ORIGIN / @loader_path rpath so the copies resolve,
 #   * the Windows delay-load helper the imported module target doesn't carry,
 #   * fabric's C++ runtime on Linux, so the test binary exercises the same
@@ -448,7 +561,7 @@ endfunction()
 function(qvac_addon_stage_fabric_for_test test_target fabric_target)
   qvac_addon_import_fabric_cxx_runtime(${test_target} ${fabric_target})
 
-  if((ANDROID OR UNIX) AND NOT APPLE)
+  if((ANDROID OR UNIX OR WIN32) AND NOT APPLE)
     target_compile_definitions(${test_target} PRIVATE GGML_BACKEND_DL)
   endif()
   target_compile_definitions(${test_target} PRIVATE
@@ -465,14 +578,23 @@ function(qvac_addon_stage_fabric_for_test test_target fabric_target)
     COMMENT "Copying qvac__fabric@0.bare to test directory")
 
   bare_target(_qvac_host)
+  qvac_addon_fabric_layout("${_qvac_host}" "${CMAKE_SOURCE_DIR}"
+    _qvac_fabric_test_specifier _qvac_fabric_test_working_dir _qvac_fabric_test_prebuilds)
   file(GLOB _qvac_fabric_test_backends
-    "${CMAKE_SOURCE_DIR}/node_modules/@qvac/fabric/prebuilds/${_qvac_host}/qvac__fabric/*.so")
+    "${_qvac_fabric_test_prebuilds}/${_qvac_host}/qvac__fabric/*${CMAKE_SHARED_LIBRARY_SUFFIX}")
   if(_qvac_fabric_test_backends)
-    add_custom_command(TARGET ${test_target} POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${_qvac_fabric_test_backends}
-        ${CMAKE_CURRENT_BINARY_DIR}/
-      COMMENT "Staging @qvac/fabric ggml backends next to ${test_target}")
+    get_property(_qvac_stage_target DIRECTORY PROPERTY QVAC_FABRIC_TEST_BACKENDS_TARGET)
+    if(NOT _qvac_stage_target)
+      string(MD5 _qvac_stage_id "${CMAKE_CURRENT_BINARY_DIR}")
+      set(_qvac_stage_target "qvac_fabric_test_backends_${_qvac_stage_id}")
+      add_custom_target(${_qvac_stage_target}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          ${_qvac_fabric_test_backends}
+          ${CMAKE_CURRENT_BINARY_DIR}/
+        COMMENT "Staging @qvac/fabric ggml backends for tests")
+      set_property(DIRECTORY PROPERTY QVAC_FABRIC_TEST_BACKENDS_TARGET "${_qvac_stage_target}")
+    endif()
+    add_dependencies(${test_target} ${_qvac_stage_target})
   endif()
 
   if(APPLE)
@@ -515,8 +637,8 @@ endfunction()
 # would wrongly suppress the resolve a sibling directory needs; a CACHE entry would
 # survive into the next configure and leave link_fuzztest() undefined.
 #
-# Requires the "fuzz" vcpkg manifest feature, which qvac_addon_preproject()
-# enables whenever BUILD_FUZZING is on.
+# Requires the "fuzz" vcpkg manifest feature, which qvac_addon_fuzz_manifest()
+# (and therefore qvac_addon_preproject()) enables whenever BUILD_FUZZING is on.
 #
 # Pass -DFUZZTEST_FUZZING_MODE=ON at configure time for coverage-guided fuzzing
 # mode; the default (OFF) is FuzzTest's unit-test mode, which runs each

@@ -23,7 +23,7 @@ add_executable(
   test_sd_vid_gen_handlers.cpp
   test_sd_video_frames.cpp
   test_video_model_capabilities.cpp
-  test_stb_image_security.cpp
+  test_image_decoding_limits.cpp
   test_wan_video.cpp
   test_avi_writer.cpp
   test_world_session.cpp
@@ -130,3 +130,7 @@ add_test(NAME SdModelTests COMMAND addon-test)
 set_tests_properties(SdModelTests PROPERTIES
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   TIMEOUT 900)  # 15 minutes
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set_tests_properties(SdModelTests PROPERTIES
+    ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/test/unit/lsan-libdbus.supp")
+endif()

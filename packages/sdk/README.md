@@ -20,7 +20,16 @@ For AI/LLM tools, use [https://docs.qvac.tether.io/llms-full.txt](https://docs.q
 
 ## Supported environments and installation
 
+For mobile apps that use only raw PCM streaming transcription, list the required audio plugins and set `"includeAudioDecoder": false` in `qvac.config.*` before bundling or running Expo prebuild. You can also use `qvac bundle sdk --defer bare-ffmpeg`. Both options leave `bare-ffmpeg` out of the native addon manifest. Bundle FFmpeg when the app decodes compressed audio files or asks `audiogen-ggml` for a compressed output format; PCM and WAV output need no FFmpeg.
+
 See https://docs.qvac.tether.io/sdk/getting-started/installation
+
+On Node.js, the SDK installs and launches its own Bare worker through `bare-runtime`.
+Its dependency range must satisfy `@qvac/inference`'s `engines.bare` requirement.
+When upgrading the SDK, reinstall dependencies with the existing lockfile so the
+package manager can replace an older, incompatible runtime. Remove any override
+or resolution that forces the worker below that requirement; installing a newer
+global `bare` executable does not change the SDK's worker dependency.
 
 ## Quickstart
 
@@ -74,6 +83,12 @@ try {
 ```bash
 node quickstart.js
 ```
+
+A first `loadModel()` call also starts the SDK's worker. If that startup ever
+exceeds its budget (cold disk cache, antivirus scanning the native addon), the
+call fails with `RPC_INIT_TIMEOUT`. Re-running usually succeeds; to give every
+start more room, raise `rpcInitTimeoutMs` in `qvac.config.*` or set the
+`QVAC_RPC_INIT_TIMEOUT_MS` environment variable.
 
 ## System resource diagnostics
 
@@ -143,16 +158,16 @@ initialized, the event omits the resource block.
 ## Pre-download model fit assessment
 
 Use `assessModelFit` to check, before downloading anything, whether models are
-likely to fit in this device's memory. It reads generated catalog metadata plus a
-fresh memory sample, and for a single candidate the registry's weightless
-description of the artifact, so the engine's own fitter can answer — no weights,
-no load:
+likely to fit in this device's memory. Each candidate is described as `loadModel`
+takes it. It reads generated catalog metadata plus a fresh memory sample, and for
+a single candidate the registry's weightless description of the artifact, so the
+engine's own fitter can answer — no weights, no load:
 
 ```ts
 import { assessModelFit, QWEN3_8B_INST_Q4_K_M } from '@qvac/sdk'
 
 const result = await assessModelFit({
-  models: [{ model: QWEN3_8B_INST_Q4_K_M, workload: { kind: 'llm', contextTokens: 8192 } }],
+  models: [{ modelSrc: QWEN3_8B_INST_Q4_K_M, modelType: 'llm', modelConfig: { ctx_size: 8192 } }],
   execution: 'sequential',
   policy: 'interactive-v1'
 })
@@ -164,9 +179,12 @@ The result is advisory: it does not block `loadModel`, reserve memory, or make a
 performance claim. `unknown` is a real answer meaning the evidence does not
 support a call either way — show it as "can't say", not as "no".
 
+The assessment holds back a reserve of its own, beyond the headroom the engine's
+fitter leaves, so a model the engine calls a fit can still come back
+`likely-too-large` on a host with little room.
+
 See [pre-download model fit assessment](./docs/assess-model-fit.md) for the
-budget arithmetic, why estimates are ranges, the supported engine and workload
-matrix, and the current calibration status.
+budget arithmetic, the reserve, and the supported engine and workload matrix.
 
 ## Streaming transcription statistics
 
@@ -186,6 +204,33 @@ console.log(stats?.audioDuration, stats?.realTimeFactor)
 
 `session.stats` resolves to `undefined` when the engine does not report
 statistics.
+
+Batch `transcribe()` calls also expose terminal statistics:
+
+```ts
+const call = transcribe({ modelId, audioChunk })
+const text = await call
+const stats = await call.stats
+console.log(text, stats?.encoderUsedCoreml)
+```
+
+`call.stats` resolves to `undefined` when the engine reports no statistics and
+rejects if transcription fails.
+
+## Parakeet Core ML encoders on Apple devices
+
+Load a supported Parakeet registry constant as usual. On macOS and iOS, the SDK
+downloads any complete, published Core ML encoder bundle with its GGUF and
+places the `.mlmodelc` directory where the native addon discovers it. This is
+available for TDT 0.6B v3, Unified English 0.6B, EOU 120M v1, and streaming
+Sortformer v2.1. The download includes the sidecar weights, so first load takes
+more time and disk space. Other platforms download only the GGUF. If the
+sidecar is unavailable or cannot load, inference uses the GGUF encoder.
+Sortformer v2.1 also needs a GGUF with the
+`parakeet.model_variant=sortformer-streaming-v2.1-aosc` metadata. Caching both
+sidecars alone does not activate Core ML. See
+[`examples/asr/parakeet-unified-coreml.ts`](examples/asr/parakeet-unified-coreml.ts)
+for a local check of a Unified GGUF and its encoder bundle.
 
 ## Examples
 

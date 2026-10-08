@@ -6,6 +6,13 @@ import BatchHandler = require("./batchHandler");
 /* eslint-enable @typescript-eslint/no-require-imports */
 import { createJobHandler, exclusiveRunQueue, QvacResponse, type JobHandler } from "@qvac/infer-base";
 import { LlamaInterface, mapAddonEvent } from "./addon";
+import {
+  assessFit as assessFitImpl,
+  type LlamaFitDevice,
+  type LlamaFitRequest,
+  type LlamaFitResult,
+  type LlamaFitStatus
+} from "./fit";
 import type * as AddonModule from "./addon";
 
 const { runBusyError } = BatchHandler;
@@ -165,6 +172,7 @@ const GENERATION_PARAM_KEYS: ReadonlySet<string> = new Set([
   "grammar",
   "json_schema",
   "tool_choice",
+  "parallel_tool_calls",
   "reasoning_budget",
   "remove_thinking_from_context",
 ]);
@@ -228,6 +236,13 @@ function normalizeGenerationParams(
     throw new TypeError(
       'generationParams.tool_choice must be "auto", "none", "required" or a declared function name',
     );
+  }
+
+  if (
+    sanitized.parallel_tool_calls !== undefined &&
+    typeof sanitized.parallel_tool_calls !== "boolean"
+  ) {
+    throw new TypeError("generationParams.parallel_tool_calls must be a boolean when provided");
   }
 
   const hasGrammar = typeof sanitized.grammar === "string" && sanitized.grammar.length > 0;
@@ -406,11 +421,13 @@ interface LlmLlamacppConstructor {
   readonly prototype: LlmLlamacpp;
   /** Returns the first shard (matching `-NNNNN-of-MMMMM.gguf`) or the sole entry for single-file models. */
   readonly pickPrimaryGgufPath: typeof pickPrimaryGgufPath;
+  readonly assessFit: typeof assessFitImpl;
 }
 
 /** LLM client wrapping the native LlamaInterface for inference, finetuning, and pause/resume. */
 const LlmLlamacpp: LlmLlamacppConstructor = class LlmLlamacpp {
   static readonly pickPrimaryGgufPath = pickPrimaryGgufPath;
+  static readonly assessFit = assessFitImpl;
   // Attached for tests; untyped because `typeof QvacResponse` is not nameable by consumers.
   static readonly QvacResponse = QvacResponse;
 
@@ -1055,7 +1072,8 @@ namespace LlmLlamacpp {
     // eslint-disable-next-line @typescript-eslint/no-redundant-type-constituents -- `NumericLike` documents the expected form; any string is accepted.
     "main-gpu"?: NumericLike | string;
     /**
-     * How to split the model across GPUs.
+     * How to split the model across devices: local GPUs, plus remote ones
+     * registered with `rpc-servers`.
      *
      * - 'none' (default) — pin the whole model to a single GPU.
      * - 'layer' — pipeline parallelism; each GPU holds a contiguous slice of
@@ -1110,6 +1128,35 @@ namespace LlmLlamacpp {
     "flash-attn"?: "on" | "off" | "auto" | "enabled" | "disabled" | "true" | "false" | "0" | "1";
     /** Proportions for distributing layers/rows across GPUs (e.g. '1,1' for equal split, '3,1' for 75/25). */
     "tensor-split"?: string;
+    /**
+     * Comma-separated `host:port` endpoints of remote `ggml-rpc-server`
+     * processes, e.g. `'10.0.0.1:50052,10.0.0.2:50052'`. Their devices join the
+     * local ones and can then be selected with `devices`, letting a single
+     * model run split across several machines.
+     *
+     * Only the machine loading the model needs the model file. Every endpoint
+     * must be reachable at load time — an unreachable one fails the load rather
+     * than being skipped. Endpoints must run a server built from the same
+     * qvac-fabric revision as this addon, since the RPC wire protocol is
+     * versioned and mismatched builds refuse to connect.
+     * With the default `split-mode: 'none'`, `devices` must name one device;
+     * automatic single-device selection never picks an RPC device.
+     * A load also fails if its final device selection uses none of the devices
+     * registered by these endpoints.
+     *
+     * The channel is unauthenticated: use it only on a trusted private network.
+     */
+    "rpc-servers"?: string;
+    /**
+     * Explicit ggml device list, e.g. `'RPC0,RPC1'`. Overrides automatic
+     * placement, including the multi-GPU behaviour of spreading across every
+     * visible device — which is rarely what you want once remote devices are
+     * registered, since the list then mixes local and remote. Names come from
+     * the ggml registry (`RPC0`, `RPC1`, … for remote devices, in the order
+     * given to `rpc-servers`). Multiple names require `split-mode: 'layer'`
+     * or `'tensor'`; the default `'none'` accepts only one device.
+     */
+    devices?: string;
     "cache-type-k"?: string;
     "cache-type-v"?: string;
     /**
@@ -1244,6 +1291,12 @@ namespace LlmLlamacpp {
     // `string & {}` keeps the three literals visible to autocomplete without
     // the union collapsing to plain `string`.
     tool_choice?: "auto" | "none" | "required" | (string & {});
+    /**
+     * Whether one response may carry more than one tool call. `true` lets the
+     * template and the tool-call grammar accept several; unset or `false`
+     * keeps one. Ignored when the prompt carries no tools.
+     */
+    parallel_tool_calls?: boolean;
     /**
      * Per-request reasoning channel budget. `-1` keeps the model's reasoning
      * channel on; `0` disables it for this request; any positive integer caps
@@ -1602,6 +1655,11 @@ namespace LlmLlamacpp {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mirrors `QvacResponse<Output = any>` in @qvac/infer-base.
   export type QvacResponse<Output = any> = InferQvacResponseOf<Output>;
+
+  export type FitRequest = LlamaFitRequest;
+  export type FitResult = LlamaFitResult;
+  export type FitStatus = LlamaFitStatus;
+  export type FitDevice = LlamaFitDevice;
 }
 
 export = LlmLlamacpp;
@@ -1609,5 +1667,6 @@ export = LlmLlamacpp;
 // Runtime-redundant: ESM named imports need the top-level `module.exports.X =` form.
 /* eslint-disable @typescript-eslint/no-unsafe-member-access -- `module.exports` is untyped CommonJS surface. */
 module.exports.pickPrimaryGgufPath = pickPrimaryGgufPath;
+module.exports.assessFit = assessFitImpl;
 module.exports.QvacResponse = QvacResponse;
 /* eslint-enable @typescript-eslint/no-unsafe-member-access */

@@ -1,9 +1,15 @@
 cmake_minimum_required(VERSION 3.25)
 
+# Shared fuzz helpers. Unmigrated addons call qvac_addon_fuzz_manifest()
+# rather than qvac_addon_preproject() so overlay triplets and Android STL
+# stay as this listfile already sets them. See docs/architecture/ADDON-FUZZING.md.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/qvac-addon/qvac-addon.cmake)
+
 option(BUILD_TESTING "Build tests" OFF)
 option(ENABLE_COVERAGE "Enable coverage" OFF)
 option(ENABLE_VULKAN "Enable Vulkan GPU acceleration" OFF)
 option(ENABLE_CUDA "Enable CUDA GPU acceleration" OFF)
+qvac_addon_fuzz_manifest()
 
 if(BUILD_TESTING)
   list(APPEND VCPKG_MANIFEST_FEATURES "tests")
@@ -40,7 +46,21 @@ configure_file(${VCPKG_INSTALLED_PATH}/tools/lint-cpp/hooks/pre-commit
                ${CMAKE_CURRENT_SOURCE_DIR}/.git/hooks/pre-commit COPYONLY)
 
 find_path(QVAC_LIB_INFERENCE_ADDON_CPP_INCLUDE_DIRS "inference-addon-cpp/ModelInterfaces.hpp")
-find_package(tts-cpp CONFIG REQUIRED)
+
+# Fuzz-only configure (BUILD_FUZZING without BUILD_TESTING): build just the
+# fuzz targets and skip engine find_package() + the .bare module so pure
+# parse/transform drivers keep full ASan + LSan.
+qvac_addon_fuzz_only_return()
+
+find_package(tts-cpp CONFIG REQUIRED COMPONENTS pocket)
+# Older configs may not implement component checks. Reject those explicitly.
+if(NOT tts-cpp_pocket_FOUND)
+  message(FATAL_ERROR
+    "tts-ggml requires a tts-cpp package containing Pocket TTS. "
+    "The selected registry source pin is too old. Install the updated "
+    "speech repository's engines/tts and set tts-cpp_DIR to its "
+    "share/tts-cpp directory; see README.md for local build instructions.")
+endif()
 find_package(mecab CONFIG REQUIRED)
 # Pull in ggml directly (in addition to the transitive
 # find_package(ggml) that tts-cppConfig.cmake already does) so the
@@ -133,7 +153,39 @@ if(((ANDROID OR UNIX) AND NOT APPLE) OR (WIN32 AND ENABLE_CUDA))
   endif()
 endif()
 
+# Developer builds may consume the shared speech ggml package on macOS.
+# Package its dylibs alongside the addon, using cmake-bare's SONAME-aware
+# install rules; the module's @loader_path rpath already points here.
+if(APPLE)
+  foreach(_library ggml::ggml ggml::ggml-base ggml::ggml-cpu tts-cpp::tts-cpp)
+    if(TARGET ${_library})
+      get_target_property(_library_type ${_library} TYPE)
+      if(_library_type STREQUAL "SHARED_LIBRARY")
+        list(APPEND BACKEND_DL_LIBS INSTALL TARGET ${_library})
+      elseif(_library_type STREQUAL "UNKNOWN_LIBRARY")
+        # ggml-config.cmake uses UNKNOWN IMPORTED targets even for dylibs.
+        # Preserve the complete symlink chain so the versioned LC_ID_DYLIB
+        # names resolve without depending on the developer's install prefix.
+        get_target_property(_dylib ${_library} IMPORTED_LOCATION)
+        if(_dylib MATCHES "\\.dylib$")
+          list(APPEND BACKEND_DYLIB_FILES "${_dylib}")
+          while(IS_SYMLINK "${_dylib}")
+            get_filename_component(_dylib_dir "${_dylib}" DIRECTORY)
+            file(READ_SYMLINK "${_dylib}" _dylib_link)
+            get_filename_component(_dylib "${_dylib_link}" ABSOLUTE BASE_DIR "${_dylib_dir}")
+            list(APPEND BACKEND_DYLIB_FILES "${_dylib}")
+          endwhile()
+        endif()
+      endif()
+    endif()
+  endforeach()
+endif()
+
 add_bare_module(tts-ggml EXPORTS ${BACKEND_DL_LIBS})
+if(BACKEND_DYLIB_FILES)
+  list(REMOVE_DUPLICATES BACKEND_DYLIB_FILES)
+  install(FILES ${BACKEND_DYLIB_FILES} DESTINATION ${BACKENDS_SUBDIR_VALUE})
+endif()
 
 # Stage every loose MODULE backend (Vulkan / OpenCL on Android, CUDA on desktop, ...)
 # into the same per-host/per-module subdir cmake-bare's INSTALL TARGET
@@ -162,9 +214,12 @@ target_sources(
     ${PROJECT_SOURCE_DIR}/addon/src/model-interface/audio8/Audio8Model.cpp
     ${PROJECT_SOURCE_DIR}/addon/src/model-interface/chatterbox/ChatterboxModel.cpp
     ${PROJECT_SOURCE_DIR}/addon/src/model-interface/moss/MossModel.cpp
+    ${PROJECT_SOURCE_DIR}/addon/src/model-interface/moss/MossSoundEffectModel.cpp
+    ${PROJECT_SOURCE_DIR}/addon/src/model-interface/moss/MossSpeechModel.cpp
     ${PROJECT_SOURCE_DIR}/addon/src/model-interface/parler/ParlerModel.cpp
     ${PROJECT_SOURCE_DIR}/addon/src/model-interface/supertonic/SupertonicModel.cpp
     ${PROJECT_SOURCE_DIR}/addon/src/model-interface/cosyvoice/CosyvoiceModel.cpp
+    ${PROJECT_SOURCE_DIR}/addon/src/model-interface/pocket/PocketModel.cpp
 )
 
 target_include_directories(
@@ -336,6 +391,8 @@ if(BUILD_TESTING)
       addon/tests/test_backend_utils.cpp
       addon/tests/test_chatterbox_config.cpp
       addon/tests/test_moss_config.cpp
+      addon/tests/test_moss_sound_effect_config.cpp
+      addon/tests/test_moss_speech_config.cpp
       addon/tests/test_parler_config.cpp
       addon/tests/test_supertonic_config.cpp
       addon/tests/test_cosyvoice_config.cpp
@@ -351,6 +408,8 @@ if(BUILD_TESTING)
       addon/src/model-interface/audio8/Audio8Model.cpp
       addon/src/model-interface/chatterbox/ChatterboxModel.cpp
       addon/src/model-interface/moss/MossModel.cpp
+      addon/src/model-interface/moss/MossSoundEffectModel.cpp
+      addon/src/model-interface/moss/MossSpeechModel.cpp
       addon/src/model-interface/parler/ParlerModel.cpp
       addon/src/model-interface/supertonic/SupertonicModel.cpp
       addon/src/model-interface/cosyvoice/CosyvoiceModel.cpp
@@ -391,3 +450,5 @@ if(BUILD_TESTING)
   # during configure-time discovery to keep configure cheap.
   add_test(NAME tts_ggml_tests COMMAND tts_ggml_tests)
 endif()
+
+qvac_addon_add_fuzz_subdirectory()

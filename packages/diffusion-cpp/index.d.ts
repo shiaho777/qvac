@@ -58,6 +58,8 @@ export interface SdConfig {
     upscaler_direct?: boolean;
     upscaler_offload_params_to_cpu?: boolean;
     upscaler_threads?: NumericLike;
+    max_image_pixels?: NumericLike;
+    max_job_pixels?: NumericLike;
     verbosity?: NumericLike;
     [key: string]: string | number | boolean | undefined;
 }
@@ -82,6 +84,7 @@ export interface EsrganUpscalerConfig {
     upscaler_direct?: boolean;
     upscaler_offload_params_to_cpu?: boolean;
     upscaler_threads?: NumericLike;
+    max_image_pixels?: NumericLike;
     device?: 'cpu' | 'gpu';
     verbosity?: NumericLike;
     [key: string]: string | number | boolean | undefined;
@@ -233,6 +236,8 @@ export declare class EsrganUpscaler {
 export declare function applyFluxImg2ImgDimDefaults(params: GenerationParams, prediction: string, hasInitImages: boolean): GenerationParams;
 export type { VideoDiffusionFiles, VideoGenerationParams, VideoMode, VideoRuntimeStats, VideoStableDiffusionArgs } from './video';
 export type { QvacResponse };
+export { assessFit } from './fit';
+export type { DiffusionFitRequest, DiffusionFitResult, DiffusionFitStatus, DiffusionFitWorkload } from './fit';
 export type VideoStableDiffusion = InstanceType<typeof VideoStableDiffusionConstructor>;
 export declare const VideoStableDiffusion: typeof VideoStableDiffusionConstructor;
 export default ImgStableDiffusion;

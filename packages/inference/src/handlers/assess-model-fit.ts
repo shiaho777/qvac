@@ -1,19 +1,19 @@
-import os from 'bare-os'
 import type {
   AssessModelFitRequest,
   AssessModelFitResponse,
   ModelFitCandidate,
-  NativeProbeFit
+  ModelFitEstimateTarget,
+  ModelFitModelRef
 } from '@/schemas/assess-model-fit'
-import { ModelType, type CanonicalModelType } from '@/schemas/index'
-import { projectFitFromStub } from '@/resources/model-fit/fit-stub/project-fit-from-stub'
-import { resolveModelConfig } from '@/runtime/state'
-import { getModelResourceProfile } from '@/models/registry/resource-profiles'
+import { isCanonicalModelType, normalizeModelType, ModelType } from '@/schemas/index'
+import { inferModelTypeFromModelSrc } from '@/schemas/model-src-utils'
+import { ModelTypeRequiredError } from '@/errors/index'
+import { projectFitFromLoad } from '@/resources/model-fit/fit-stub/project-fit-from-load'
 import type { SystemResources } from '@/schemas/system-resources'
 import { getResourceCollector } from '@/resources/instance'
-import { assessModelFitFromResources, type ProfileResolver } from '@/resources/model-fit/assess'
-import { getPlatformCalibration } from '@/resources/model-fit/calibration/index'
-import type { ModelFitPlatform } from '@/resources/model-fit/types'
+import { getConfig } from '@/runtime/state'
+import { assessModelFitFromResources, type NativeCandidateFit } from '@/resources/model-fit/assess'
+import { detectPlatform } from '@/resources/model-fit/platform'
 
 /**
  * Runs a pre-download fit assessment worker-side.
@@ -21,94 +21,280 @@ import type { ModelFitPlatform } from '@/resources/model-fit/types'
  * This lives on the worker because that is where the three things it needs
  * already are: the resource collector for a fresh memory sample, the runtime's
  * own platform/arch pair, and the registry client. No weights are read and
- * nothing is loaded — a single candidate additionally has the registry's
- * weightless description fetched, tens of KB, so the engine's own fitter can
- * answer instead of the coefficients modelling it.
+ * nothing is loaded — each candidate additionally has the registry's weightless
+ * description fetched, tens of KB, so the engine's own fitter can answer.
  */
 export async function handleAssessModelFit(
   request: AssessModelFitRequest
 ): Promise<AssessModelFitResponse> {
   const platform = detectPlatform()
+  const nativeFits = await resolveNativeFits(request.models)
 
   const result = assessModelFitFromResources({
-    models: request.models,
+    models: request.models.map(estimateTargetFor),
     execution: request.execution,
     resources: readResources(),
     platform,
-    calibration: platform ? getPlatformCalibration(platform) : undefined,
-    nativeFit: await resolveNativeFit(request)
+    nativeFits
   })
 
   return { type: 'assessModelFit', ...result }
 }
 
 /**
- * The engine fitter's verdict for a single candidate, read from the registry's
- * fit stub.
+ * The engine that would run this load, named outright or read off the source,
+ * as `loadModel` resolves it.
  *
- * Only for a one-candidate request: the probe measures one model against the
- * whole machine, which cannot be aggregated across a set. Everything else — no
- * stub published, an offline caller, an engine with no fit path — resolves to
- * `undefined` and the modelled assessment stands.
+ * @throws {ModelTypeRequiredError} When neither names one.
  */
-async function resolveNativeFit(
-  request: AssessModelFitRequest
-): Promise<NativeProbeFit | undefined> {
-  if (request.models.length !== 1) return undefined
+function modelTypeOf(candidate: ModelFitCandidate): string {
+  if (candidate.modelType !== undefined) return normalizeModelType(candidate.modelType)
 
-  const candidate = request.models[0]
-  if (!candidate) return undefined
+  const inferred = inferModelTypeFromModelSrc(candidate.modelSrc)
+  if (inferred === undefined) throw new ModelTypeRequiredError()
 
-  const load = fitLoad(candidate)
-  if (!load) return undefined
-
-  const outcome = await projectFitFromStub({ model: candidate.model, ...load })
-
-  return outcome.status === 'projected' ? outcome.fit : undefined
+  return normalizeModelType(inferred)
 }
 
-export interface FitLoad {
-  modelType: CanonicalModelType
-  modelConfig: Record<string, unknown>
+/** The audio engines, whose estimator sizes a load by its window rather than a context. */
+const AUDIO_ENGINES: readonly string[] = [
+  'whispercpp-transcription',
+  'parakeet-transcription',
+  'bci-whispercpp-transcription'
+]
+
+/**
+ * Engines that name a device outright, in llama's own `gpu` / `cpu` spelling.
+ * Both default to the GPU.
+ */
+const DEVICE_NAMED: readonly string[] = [ModelType.llamacppCompletion, ModelType.llamacppEmbedding]
+
+function contextUsesGpu(config: Record<string, unknown>): unknown {
+  const contextParams = config['contextParams']
+  if (contextParams === null || typeof contextParams !== 'object') return undefined
+  return (contextParams as Record<string, unknown>)['use_gpu']
 }
 
 /**
- * The load `loadModel` would run for this candidate, or `undefined` where no
- * fitter covers it.
- *
- * The engine comes from the catalog profile, not from the workload: `llm` names
- * a token-context workload and covers embedding models too, which the
- * completion fitter refuses for asking more context than they declare. The
- * config carries the same device defaults a real load resolves — the fitter
- * answers `unsupported-config` for a load with no `device`. An embedding load
- * has no context setting; the fitter reads the window the model declares.
- *
- * A candidate with companion `artifacts` gets no fitter: the estimator counts
- * their bytes, the fitter reads one file, and a verdict for the model alone
- * would stand in for the set.
+ * Engines that carry a GPU switch, each read at the key its own config spells
+ * it under. These are the keys the fit builders read in `native-probe/engines`,
+ * so a projection and a device never disagree. Only bci defaults to on.
  */
-export function fitLoad(
-  candidate: ModelFitCandidate,
-  resolveProfile: ProfileResolver = getModelResourceProfile
-): FitLoad | undefined {
-  if (candidate.workload.kind !== 'llm') return undefined
-  if (candidate.artifacts?.length) return undefined
+const GPU_SWITCH: Record<string, (config: Record<string, unknown>) => boolean> = {
+  [ModelType.ttsGgml]: (config) => config['useGPU'] === true,
+  [ModelType.audiogenGgml]: (config) => config['useGPU'] === true,
+  [ModelType.parakeetTranscription]: (config) => config['useGPU'] === true,
+  [ModelType.whispercppTranscription]: (config) => contextUsesGpu(config) === true,
+  [ModelType.bciWhispercppTranscription]: (config) => contextUsesGpu(config) !== false
+}
 
-  // A model outside the catalog is taken as a completion model, the common
-  // case for an `llm` workload.
-  const engine =
-    resolveProfile(candidate.model.sha256Checksum)?.engine ?? ModelType.llamacppCompletion
-
-  if (engine === ModelType.llamacppEmbedding) {
-    return { modelType: engine, modelConfig: resolveModelConfig(engine, {}) }
+/**
+ * Where a load resolved to run. `dispatch` applies the host's device defaults
+ * before any handler sees the config, so what arrives here is the resolved one.
+ *
+ * `nGpuLayers` wins over `useGPU` on tts, and the config schema rejects the two
+ * disagreeing, so reading it first is safe.
+ */
+function resolvedDevice(modelType: string, config: Record<string, unknown>): string | undefined {
+  if (DEVICE_NAMED.includes(modelType)) {
+    const device = config['device']
+    return typeof device === 'string' ? device.toLowerCase() : 'gpu'
   }
-  if (engine === ModelType.llamacppCompletion) {
-    return {
-      modelType: engine,
-      modelConfig: resolveModelConfig(engine, { ctx_size: candidate.workload.contextTokens })
+
+  const layers = config['nGpuLayers']
+  if (modelType === ModelType.ttsGgml && typeof layers === 'number') {
+    return layers === 0 ? 'cpu' : 'gpu'
+  }
+
+  const usesGpu = GPU_SWITCH[modelType]
+  if (usesGpu === undefined) return undefined
+
+  return usesGpu(config) ? 'gpu' : 'cpu'
+}
+
+/** The window the speech engines hold whole; longer audio is chunked into it. */
+const AUDIO_WINDOW_MS = 30_000
+
+/**
+ * The audio a single call holds in memory. `duration_ms` is the longest clip
+ * the caller will transcribe, not a per-call window, and the engine chunks
+ * anything longer, so it never sizes working memory above one window.
+ */
+function audioWindowMs(config: Record<string, unknown>): number {
+  const declared = config['duration_ms']
+  if (typeof declared !== 'number' || declared <= 0) return AUDIO_WINDOW_MS
+  return Math.min(declared, AUDIO_WINDOW_MS)
+}
+
+/** The catalog facts a source carries, where it carries them. */
+function modelRefOf(value: unknown): ModelFitModelRef | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const src = value as Record<string, unknown>
+  if (typeof src['sha256Checksum'] !== 'string') return undefined
+
+  const name = src['name'] ?? src['modelId'] ?? src['registryPath']
+  return {
+    name: typeof name === 'string' ? name : '',
+    sha256Checksum: src['sha256Checksum'],
+    ...(typeof src['registryPath'] === 'string' && { registryPath: src['registryPath'] }),
+    ...(typeof src['registrySource'] === 'string' && { registrySource: src['registrySource'] })
+  }
+}
+
+/**
+ * The companion sources a load carries in its config — a VAD model, a pivot,
+ * an audiogen stage, a projector. Their bytes are part of what the set costs,
+ * so the estimate counts them alongside the primary.
+ */
+function companionRefs(config: Record<string, unknown>): ModelFitModelRef[] {
+  const refs: ModelFitModelRef[] = []
+  const seen = new Set<string>()
+
+  const add = (ref: ModelFitModelRef): void => {
+    if (seen.has(ref.sha256Checksum)) return
+    seen.add(ref.sha256Checksum)
+    refs.push(ref)
+  }
+
+  const walk = (key: string, value: unknown): void => {
+    const ref = modelRefOf(value)
+    if (ref !== undefined) {
+      add(ref)
+      return
+    }
+    if (key.endsWith('ModelSrc')) {
+      add({ name: typeof value === 'string' ? value : key, sha256Checksum: '' })
+      return
+    }
+    if (value === null || typeof value !== 'object') return
+    for (const [inner, nested] of Object.entries(value as Record<string, unknown>)) {
+      walk(inner, nested)
     }
   }
-  return undefined
+
+  for (const [key, value] of Object.entries(config)) walk(key, value)
+  return refs
+}
+
+/**
+ * What the estimator is given for one candidate. The catalog facts come from
+ * the source's checksum, and the workload from the settings the load carries;
+ * a source outside the catalog resolves neither and assesses as `unknown`.
+ *
+ * A load whose sources are all config fields carries no checksum, so it has no
+ * catalog profile and the engine's own fitter is its only evidence. The model
+ * type stands in as the label.
+ */
+export function estimateTargetFor(candidate: ModelFitCandidate): ModelFitEstimateTarget {
+  const descriptor = typeof candidate.modelSrc === 'string' ? undefined : candidate.modelSrc
+  const location = typeof candidate.modelSrc === 'string' ? candidate.modelSrc : undefined
+  const config = candidate.modelConfig ?? {}
+  const modelType = modelTypeOf(candidate)
+
+  const contextTokens = config['ctx_size']
+  const artifacts = companionRefs(config)
+  const device = resolvedDevice(modelType, config)
+
+  return {
+    model: {
+      name: descriptor?.name ?? descriptor?.modelId ?? location ?? modelType,
+      sha256Checksum: descriptor?.sha256Checksum ?? '',
+      ...(descriptor?.registryPath !== undefined && { registryPath: descriptor.registryPath }),
+      ...(descriptor?.registrySource !== undefined && {
+        registrySource: descriptor.registrySource
+      })
+    },
+    ...(artifacts.length > 0 && { artifacts }),
+    ...(device !== undefined && { device }),
+    workload: AUDIO_ENGINES.includes(modelType)
+      ? {
+          kind: 'audio',
+          windowMs: audioWindowMs(config),
+          streaming: config['streaming'] === true
+        }
+      : {
+          kind: 'llm',
+          ...(typeof contextTokens === 'number' && contextTokens > 0 && { contextTokens })
+        }
+  }
+}
+
+/** The engine fitter's verdict for one candidate, through that load's plugin. */
+async function resolveNativeFit(
+  candidate: ModelFitCandidate,
+  alreadyCounted: number
+): Promise<NativeCandidateFit> {
+  const modelType = modelTypeOf(candidate)
+  if (!isCanonicalModelType(modelType)) {
+    return { unavailable: `no plugin handles model type ${modelType}` }
+  }
+
+  const budgetMs = getConfig().fitStubBudgetMs
+
+  const outcome = await projectFitFromLoad(
+    {
+      modelType,
+      ...(candidate.modelSrc !== undefined && { modelSrc: candidate.modelSrc }),
+      ...(candidate.modelConfig !== undefined && { modelConfig: candidate.modelConfig })
+    },
+    estimateTargetFor(candidate).model.name,
+    {
+      ...(budgetMs !== undefined && { stub: { budgetMs } }),
+      ...(alreadyCounted > 0 && { fit: { extraResidentBytes: alreadyCounted } })
+    }
+  )
+
+  if (outcome.status === 'projected') return { fit: outcome.fit }
+  if (outcome.status === 'unsupported-load') return { unavailable: outcome.detail }
+
+  return {
+    unavailable:
+      outcome.message === undefined
+        ? `no registry description (${outcome.reason})`
+        : `no registry description (${outcome.reason}): ${outcome.message}`
+  }
+}
+
+/** What a projection holds for the model's lifetime, the breakdown or the total. */
+function residentBytesOf(fit: NativeCandidateFit): number {
+  const projection = fit.fit?.projection
+  if (!projection) return 0
+
+  const { weightsBytes, contextBytes, deviceBytes, hostBytes } = projection
+  const resident =
+    weightsBytes === undefined || contextBytes === undefined
+      ? deviceBytes
+      : weightsBytes + contextBytes
+
+  return (resident ?? 0) + (hostBytes ?? 0)
+}
+
+/**
+ * One verdict per candidate, in request order. Each probe measures its own
+ * model against the whole machine, so the bytes compose where the verdicts do
+ * not, and `assess` combines them under one budget.
+ *
+ * Run one at a time, so a set never holds several fitters open at once.
+ *
+ * Each probe holds back what the earlier ones projected, since none of them is
+ * registered in this worker and the fitter would otherwise place every
+ * candidate in the same free memory. Every model is resident under either
+ * execution mode, so the holdback does not read it. The answer follows the
+ * order the caller listed the models in.
+ */
+async function resolveNativeFits(
+  candidates: readonly ModelFitCandidate[]
+): Promise<NativeCandidateFit[]> {
+  const fits: NativeCandidateFit[] = []
+  let alreadyCounted = 0
+
+  for (const candidate of candidates) {
+    const fit = await resolveNativeFit(candidate, alreadyCounted)
+    fits.push(fit)
+    alreadyCounted += residentBytesOf(fit)
+  }
+
+  return fits
 }
 
 function readResources(): SystemResources {
@@ -136,32 +322,4 @@ function readResources(): SystemResources {
   }
 
   return { capabilities: collector.getCapabilities(), sample: collector.sample() }
-}
-
-/**
- * Maps the runtime's platform and architecture onto a calibration target.
- *
- * @returns `undefined` for any pair this feature has no calibration target for,
- *   which assesses as `unknown` rather than borrowing another platform's
- *   coefficients.
- */
-function detectPlatform(): ModelFitPlatform | undefined {
-  const key = `${os.platform()}-${os.arch()}`
-  switch (key) {
-    case 'darwin-arm64':
-    case 'darwin-x64':
-    case 'linux-arm64':
-    case 'linux-x64':
-    case 'win32-x64':
-    // Listed for completeness rather than reach: no engine addon is built for
-    // win32-arm64 (`@qvac/llm-llamacpp/prebuilds` has no such target, and no
-    // windows-arm runner exists to build one), so nothing on that platform can
-    // load a model today. Calibrating it needs that build first, not a fixture.
-    case 'win32-arm64':
-    case 'android-arm64':
-    case 'ios-arm64':
-      return key
-    default:
-      return undefined
-  }
 }

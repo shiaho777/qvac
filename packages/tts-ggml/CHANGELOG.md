@@ -9,11 +9,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Metadata-only `assessFit()` for MOSS-SoundEffect, with required model path,
+  prompt and duration, shared generation controls, and host/device memory estimates.
+
+- MOSS-SoundEffect engine (`engine: 'moss-sfx'`, OpenMOSS MOSS-SoundEffect-v2):
+  48 kHz sound effects of up to 30 seconds from a text description, from one
+  GGUF (`files.mossSoundEffect`, or `moss-sfx-*.gguf` in `modelDir`). `run()`
+  takes per-call `seconds`, `negativePrompt`, `steps`, `guidance` and `shift`;
+  there is no streaming. Desktop, with a GPU recommended.
+- MOSS-Speech engine (`engine: 'moss-speech'`, fnlp MOSS-Speech): answers a
+  spoken question (`run({ audio, sampleRate })`, or a typed `input`) with a
+  24 kHz spoken reply and its text (`data.text`), from a language-model GGUF
+  plus a codec GGUF (`files.mossSpeechModel` / `files.mossSpeechCodec`, or
+  `moss-speech-*.gguf` in `modelDir`). Per call: earlier turns in `messages`,
+  `systemPrompt`, a reply voice (`replyVoice`), `maxReplySeconds`,
+  `maxNewTokens`, `textReply` and sampling controls; there is no streaming.
+  Desktop, with a GPU.
+- Bounded FuzzTest coverage for the JS-adapter config string parsers
+  (`parseIntString`, `parseFloatString`). Linux C++ CI runs the suite after
+  unit tests. The parsers compile without tts-cpp, so ASan and LeakSanitizer
+  stay at full strength. No public addon API changes.
+
+### Changed
+
+- Raise the `speech-cpp` floor to `2026-10-06#2`. Parler-TTS reuses its
+  decode-step memory plan instead of rebuilding it before every step; output
+  is unchanged.
+- Raise the `speech-cpp` and `ggml-speech` floors to `2026-10-06`. Supertonic
+  synthesis is unchanged on every backend this package builds.
+- Raise the `ggml-speech` floor to `2026-10-02`. The speech ggml now includes
+  the ggml changes of the QVAC LLM stack, so both build from the same backend
+  code. Same models, same backends, no API change.
+- Raise the `speech-cpp` floor to `2026-10-02#1`, the revision that ships the
+  MOSS-SoundEffect and MOSS-Speech engines. It also runs Parler-TTS 1.6x to
+  2.4x faster on the CPU backend (flash attention over the KV cache, a
+  multi-threaded GELU, and on macOS/iOS the codec's convolutions on
+  Accelerate) and keeps the Audio8 Core ML codec on the Neural Engine. Same
+  models, same API.
+- Audio8 is faster on Apple silicon: its language model's projections are
+  fused at load (1.24-1.28x end to end on Metal on an M3 Ultra, 1.04-1.06x
+  on an M4), and the Core ML codec now synthesises during generation rather
+  than after it (1.36-1.42x on an M3 Ultra, 1.06-1.16x on an M4). Output is
+  unchanged on Metal. With several Vulkan adapters, Audio8 now runs on a
+  discrete GPU rather than on the first adapter listed, which on a desktop
+  with an integrated GPU was the iGPU.
+- Raise `bare-subprocess` to `^6.2.1`. Its `spawnSync` now returns an `error`
+  instead of throwing when a command cannot start, and exit events report
+  signal names. `examples/pcm-chunk-player.js` checks for that error, so it
+  still falls back to another player when `ffplay` or `play` is missing.
+
+### Fixed
+
+- Raise the `ggml-speech` floor to `2026-09-30`. On Metal, `assessFit` no longer
+  reports more free device memory than total once the process has allocated
+  past the GPU's recommended working set, which made a model that does not fit
+  report `fits`. Synthesis is unchanged.
+- Audio8 with `useGPU: true` no longer aborts on Snapdragon 8 Elite (Adreno
+  830) phones: its KV-cache write no longer needs a strided copy, which the
+  OpenCL backend could not run there.
+
+## [0.10.1] - 2026-09-29
+
+### Fixed
+
+- Raise the `speech-cpp` floor to `2026-09-28`. `assessFit` on a Supertonic,
+  Chatterbox or CosyVoice voice no longer aborts the process on hosts whose GPU
+  does not run the whole graph; the projection is priced on the primary backend
+  and returns a verdict. Synthesis is unchanged.
+- `assessFit` now resolves the backends directory the same way a load does
+  (`prebuilds/<platform>-<arch>/<module>`), so a fit projection finds the ggml
+  backend modules on the split-backend layouts (Linux, macOS, Android) instead
+  of reporting `no-backend-device` or measuring against whatever an earlier
+  load happened to leave in the process.
+
+### Changed
+
+- Raise the `ggml-speech` floor to `2026-09-28` and the `speech-cpp` floor to
+  `2026-09-25#1`. The OpenCL backend no longer crashes on Adreno GPUs when a
+  buffer type is queried before the backend is initialized. Same models, same
+  backends, no API change.
+
+## [0.10.0] - 2026-09-25
+
+### Added
+
+- Native Pocket TTS with converted FlowLM/Mimi bundles, prepared voices or
+  reference-WAV conditioning, and native audio streaming through the addon
+  run, runStream and runStreaming APIs. Supports explicit flow-sampling steps;
+  four steps are recommended for the observed one-step speech artifact.
+
 - Apple Core ML (Neural Engine) sidecars on the macOS / iOS builds, for the
   Supertonic vocoder and the Audio8 codec. Presence-driven: a stage runs on a
   compiled `.mlmodelc` staged next to its model file and falls back to ggml
   when it is absent, so existing model directories are unaffected. On an
-  Apple M4 the Supertonic vocoder is 2.5-2.9x faster than on Metal; on
+  Apple M4 the Supertonic vocoder is 1.6-2.9x faster than on Metal; on
   workstation-class GPUs Metal still wins, so sidecars are staged per
   deployment. `q4_0` models keep the ggml vocoder.
 - **CosyVoice3 weight tiers in the README.** The model-directory layout now
@@ -21,12 +110,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine accepts beside `f32`, and which one is fastest on each backend.
   Component resolution goes by filename prefix and does not rank
   quantizations, so stage one file per component or name it explicitly.
+- **Audio8 Core ML runtime stats.** `codecSidecarLoaded` reports whether the
+  codec sidecar remains attached; `codecOnCoreml` reports whether the last
+  synthesis used it. Both flags survive streaming as the last reported chunk
+  value, reset on unload, and ignore results from an engine replaced by reload.
 - MOSS engine (`engine: 'moss'`, OpenMOSS MOSS-TTS v1.5 Delay): 24 kHz
-  synthesis from three GGUFs (`files.mossBackbone`, `files.mossCodecDecoder`,
-  and `files.mossCodecEncoder` to clone a voice from `referenceAudio`),
-  auto-detected from `modelDir`. `streamChunkTokens > 0` streams fixed-size
-  chunks of codec frames (12.5 per second) while the backbone is still
-  generating. Desktop only: the backbone has 8B parameters.
+  synthesis from a backbone and the two codec halves (`files.mossBackbone`,
+  `files.mossCodecDecoder`, and `files.mossCodecEncoder` to clone a voice from
+  `referenceAudio`), auto-detected from `modelDir`. `streamChunkTokens > 0`
+  streams fixed-size chunks of codec frames (12.5 per second) while the
+  backbone is still generating. `durationTokens` sets a target length,
+  `[pause Ns]` markers and inline Pinyin / IPA steer the speech, and
+  `dialogueReferences` (one 24 kHz recording per speaker, with the text opening
+  with their transcripts) drives MOSS-TTSD multi-speaker dialogue on the
+  `moss-ttsd-*.gguf` backbone. Desktop only: the backbones have 8B parameters.
 - Engine options, results and library queries that tts-cpp already provided
   but the addon did not expose:
   - Chatterbox: `nPredict` (the per-call speech-token cap, previously fixed at
@@ -56,13 +153,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     through tts-cpp's `tts_cpp_log_set` instead of stderr. Engine diagnostics
     that tts-cpp still prints straight to stderr are unaffected.
 
+### Fixed
+
+- Include the standalone Pocket BareKit worklet in published packages and
+  guard shared mobile runners against imports that break after concatenation.
+
 ### Changed
 
-- Raise the `speech-cpp` floor to `2026-09-23#3` for the MOSS engine above.
-- Raise the `speech-cpp` floor to `2026-09-23`. Parler and Audio8 now accept a
-  weightless fit-measure model that carries no vocabulary, which a memory-fit
-  measurement never needs; loading a real model is unchanged and still
-  requires one.
+- Release the loaded Pocket model before activating its replacement on reload,
+  avoiding two live model allocations. Failed activation leaves the instance
+  unloaded with its last successful configuration available for `load()`.
+- Expose optional firstAudioMs stats and chunkIndex/isLast output metadata;
+  preserve first-audio latency during streaming aggregation.
+- Include the Pocket CPU planner and EOS-tail fixes from the speech dependencies.
+- Resolve Pocket CPU memory planning through the dynamically loaded backend,
+  fixing unresolved `ggml_graph_plan` imports in Linux and Android prebuilds.
+- Raise the `ggml-speech` floor to `2026-09-23` and the `speech-cpp` floor to
+  `2026-09-24` for the MOSS engine above. The speech ggml now tracks upstream
+  ggml 0.20.2 (was 0.10.2),
+  and its Vulkan backend no longer crashes during CosyVoice3 GPU synthesis on
+  NVIDIA GPUs that report cooperative-matrix2 support. The pinned engine also
+  brings the MOSS engine above, and Parler and Audio8 now accept a weightless
+  fit-measure model that carries no vocabulary, which a memory-fit measurement
+  never needs; loading a real model is unchanged and still requires one.
+  Existing CosyVoice3 and Supertonic models are unaffected, and there is no API
+  change beyond the MOSS additions above.
 - Raise the `speech-cpp` floor to `2026-09-21`, for the Core ML sidecars above
   and for a round of CosyVoice3 optimizations that needs no model change. On
   Metal, single-token LM decode runs one flash-attention op per layer instead

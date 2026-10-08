@@ -7,6 +7,7 @@ const BatchHandler = require("./batchHandler");
 /* eslint-enable @typescript-eslint/no-require-imports */
 const infer_base_1 = require("@qvac/infer-base");
 const addon_1 = require("./addon");
+const fit_1 = require("./fit");
 const { runBusyError } = BatchHandler;
 function normalizeRunOptions(runOptions) {
     if (runOptions === undefined) {
@@ -96,6 +97,7 @@ const GENERATION_PARAM_KEYS = new Set([
     "grammar",
     "json_schema",
     "tool_choice",
+    "parallel_tool_calls",
     "reasoning_budget",
     "remove_thinking_from_context",
 ]);
@@ -143,6 +145,10 @@ function normalizeGenerationParams(generationParams) {
     if (sanitized.tool_choice !== undefined &&
         (typeof sanitized.tool_choice !== "string" || sanitized.tool_choice.length === 0)) {
         throw new TypeError('generationParams.tool_choice must be "auto", "none", "required" or a declared function name');
+    }
+    if (sanitized.parallel_tool_calls !== undefined &&
+        typeof sanitized.parallel_tool_calls !== "boolean") {
+        throw new TypeError("generationParams.parallel_tool_calls must be a boolean when provided");
     }
     const hasGrammar = typeof sanitized.grammar === "string" && sanitized.grammar.length > 0;
     const hasJsonSchema = sanitized.json_schema !== undefined &&
@@ -257,6 +263,7 @@ function sanitizePromptForLog(prompt) {
 /** LLM client wrapping the native LlamaInterface for inference, finetuning, and pause/resume. */
 const LlmLlamacpp = class LlmLlamacpp {
     static pickPrimaryGgufPath = pickPrimaryGgufPath;
+    static assessFit = fit_1.assessFit;
     // Attached for tests; untyped because `typeof QvacResponse` is not nameable by consumers.
     static QvacResponse = infer_base_1.QvacResponse;
     addon;
@@ -786,6 +793,7 @@ const LlmLlamacpp = class LlmLlamacpp {
 // Runtime-redundant: ESM named imports need the top-level `module.exports.X =` form.
 /* eslint-disable @typescript-eslint/no-unsafe-member-access -- `module.exports` is untyped CommonJS surface. */
 module.exports.pickPrimaryGgufPath = pickPrimaryGgufPath;
+module.exports.assessFit = fit_1.assessFit;
 module.exports.QvacResponse = infer_base_1.QvacResponse;
 module.exports = LlmLlamacpp;
 /* eslint-enable @typescript-eslint/no-unsafe-member-access */
