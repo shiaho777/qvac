@@ -6,12 +6,22 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.2] - 2026-10-09
+
 ### Added
 
 - Add `assessFit` to estimate whether EasyOCR or DocTR detector and recognizer
   weights fit on the selected backend at model load time. The estimate excludes
   image-dependent inference memory; unsupported split-device configurations
   return an unavailable verdict.
+
+## [0.27.1] - 2026-10-08
+
+### Fixed
+
+- Rebuild Android prebuilds with NDK 29 to restore compatibility with the app's
+  C++ runtime and fix addon loading failures caused by the missing
+  `std::__ndk1::__hash_memory` symbol in the NDK 30 builds published in `0.27.0`.
 
 ## [0.27.0] - 2026-10-06
 
